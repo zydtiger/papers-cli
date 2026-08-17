@@ -59,9 +59,16 @@ uv run pytest
 
 Live-provider smoke checks are intentionally not part of the test suite.
 
-## Installing the project skill
+## Installing the executable and project skill
 
-After this repository has a published location, install the committed root skill globally in file mode (do not run this against an unknown remote):
+Install the `papers` executable globally with uv:
+
+```sh
+uv tool install git+https://github.com/zydtiger/papers-cli.git
+papers sources --json
+```
+
+Then install the committed root skill globally in file mode:
 
 ```sh
 skillctl add --global https://github.com/zydtiger/papers-cli.git --file SKILL.md --name papers-cli-skill --ref main
