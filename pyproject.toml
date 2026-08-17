@@ -1,0 +1,43 @@
+[project]
+name = "papers-cli"
+version = "0.1.0"
+description = "A local-first CLI for finding, downloading, and verifying research papers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "defusedxml>=0.7.1,<1",
+  "httpx>=0.27,<1",
+  "platformdirs>=4.2,<5",
+]
+
+[project.scripts]
+papers = "papers_cli.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pyright>=1.1.390,<2",
+  "ruff>=0.9,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/papers_cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["src", "tests"]

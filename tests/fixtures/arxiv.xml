@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/2301.00001v2</id>
+    <updated>2023-01-03T00:00:00Z</updated>
+    <published>2023-01-01T00:00:00Z</published>
+    <title> A  Test   Paper </title>
+    <summary> An abstract\nwith spacing. </summary>
+    <author><name>Alice Example</name></author>
+    <author><name>Bob Example</name></author>
+    <category term="cs.AI" />
+    <arxiv:doi>10.1000/Test</arxiv:doi>
+    <link title="pdf" href="https://arxiv.org/pdf/2301.00001v2" />
+  </entry>
+</feed>
