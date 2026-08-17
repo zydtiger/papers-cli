@@ -37,6 +37,21 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float:
     return 0.25 * (2**attempt)
 
 
+def _staging_error() -> PapersError:
+    return PapersError(
+        "storage_staging",
+        "Unable to write the temporary PDF download",
+        exit_code=5,
+    )
+
+
+def _remove_staging_file(staging: Path) -> None:
+    try:
+        staging.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def download_pdf(
     client: httpx.Client, url: str, allowed_hosts: frozenset[str], paths: AppPaths
 ) -> DownloadedFile:
@@ -97,34 +112,52 @@ def download_pdf(
 
 
 def _store_stream(response: httpx.Response, source_url: str, paths: AppPaths) -> DownloadedFile:
-    paths.download_cache_dir.mkdir(parents=True, exist_ok=True)
-    descriptor, staging_name = tempfile.mkstemp(
-        prefix="download-", suffix=".part", dir=paths.download_cache_dir
-    )
+    try:
+        paths.download_cache_dir.mkdir(parents=True, exist_ok=True)
+        descriptor, staging_name = tempfile.mkstemp(
+            prefix="download-", suffix=".part", dir=paths.download_cache_dir
+        )
+    except OSError as exc:
+        raise _staging_error() from exc
     staging = Path(staging_name)
     digest = hashlib.sha256()
     size = 0
     prefix = bytearray()
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            for chunk in response.iter_bytes(chunk_size=64 * 1024):
-                if not chunk:
-                    continue
-                if len(prefix) < 5:
-                    prefix.extend(chunk[: 5 - len(prefix)])
-                size += len(chunk)
-                if size > MAX_BYTES:
+        try:
+            handle = os.fdopen(descriptor, "wb")
+        except OSError as exc:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise _staging_error() from exc
+        try:
+            with handle:
+                for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    if len(prefix) < 5:
+                        prefix.extend(chunk[: 5 - len(prefix)])
+                    size += len(chunk)
+                    if size > MAX_BYTES:
+                        raise PapersError(
+                            "download_too_large",
+                            "PDF exceeds the 100 MiB download limit",
+                            exit_code=4,
+                        )
+                    digest.update(chunk)
+                    handle.write(chunk)
+                if bytes(prefix) != b"%PDF-":
                     raise PapersError(
-                        "download_too_large", "PDF exceeds the 100 MiB download limit", exit_code=4
+                        "not_pdf",
+                        "Provider response does not start with a PDF signature",
+                        exit_code=4,
                     )
-                digest.update(chunk)
-                handle.write(chunk)
-            if bytes(prefix) != b"%PDF-":
-                raise PapersError(
-                    "not_pdf", "Provider response does not start with a PDF signature", exit_code=4
-                )
-            handle.flush()
-            os.fsync(handle.fileno())
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            raise _staging_error() from exc
         sha256 = digest.hexdigest()
         relative = Path("objects") / "sha256" / sha256[:2] / sha256[2:4] / f"{sha256}.pdf"
         destination = paths.data_dir / relative
@@ -149,5 +182,5 @@ def _store_stream(response: httpx.Response, source_url: str, paths: AppPaths) ->
             sha256=sha256, byte_count=size, relative_path=relative.as_posix(), source_url=source_url
         )
     except Exception:
-        staging.unlink(missing_ok=True)
+        _remove_staging_file(staging)
         raise

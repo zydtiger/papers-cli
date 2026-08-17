@@ -119,6 +119,66 @@ def test_download_reports_destination_directory_failure_and_removes_cached_part(
     assert data_file.read_text() == "not a directory"
 
 
+def test_download_reports_blocked_cache_directory_failure(tmp_path) -> None:
+    cache_file = tmp_path / "cache-file"
+    cache_file.write_text("not a directory")
+    paths = AppPaths(tmp_path / "data", cache_file)
+    body = b"%PDF-1.7\nfixture"
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/pdf"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+
+    assert error.value.code == "storage_staging"
+    assert cache_file.read_text() == "not a directory"
+
+
+def test_download_reports_mkstemp_failure(tmp_path, monkeypatch) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    body = b"%PDF-1.7\nfixture"
+
+    def fail_mkstemp(**_: object) -> tuple[int, str]:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(downloader.tempfile, "mkstemp", fail_mkstemp)
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/pdf"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+
+    assert error.value.code == "storage_staging"
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+
+
+def test_download_reports_temporary_file_fsync_failure(tmp_path, monkeypatch) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    body = b"%PDF-1.7\nfixture"
+
+    def fail_fsync(_: int) -> None:
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(downloader.os, "fsync", fail_fsync)
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/pdf"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+
+    assert error.value.code == "storage_staging"
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+    assert not list(paths.objects_dir.rglob("*.pdf"))
+
+
 def test_download_keeps_installed_object_when_directory_fsync_fails(tmp_path, monkeypatch) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
