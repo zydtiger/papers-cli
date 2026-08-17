@@ -128,23 +128,23 @@ def _store_stream(response: httpx.Response, source_url: str, paths: AppPaths) ->
         sha256 = digest.hexdigest()
         relative = Path("objects") / "sha256" / sha256[:2] / sha256[2:4] / f"{sha256}.pdf"
         destination = paths.data_dir / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists():
-            staging.unlink()
-        else:
-            try:
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                staging.unlink()
+            else:
                 os.replace(staging, destination)
                 parent_fd = os.open(destination.parent, os.O_RDONLY)
                 try:
                     os.fsync(parent_fd)
                 finally:
                     os.close(parent_fd)
-            except OSError as exc:
-                raise PapersError(
-                    "storage_install",
-                    "Unable to atomically install the verified PDF",
-                    exit_code=5,
-                ) from exc
+        except OSError as exc:
+            raise PapersError(
+                "storage_install",
+                "Unable to atomically install the verified PDF",
+                exit_code=5,
+            ) from exc
         return DownloadedFile(
             sha256=sha256, byte_count=size, relative_path=relative.as_posix(), source_url=source_url
         )

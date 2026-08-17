@@ -98,3 +98,52 @@ def test_download_reports_atomic_move_failure_and_removes_cached_part(
     assert error.value.code == "storage_install"
     assert not list(paths.download_cache_dir.glob("download-*.part"))
     assert not list(paths.objects_dir.rglob("*.pdf"))
+
+
+def test_download_reports_destination_directory_failure_and_removes_cached_part(tmp_path) -> None:
+    data_file = tmp_path / "data-file"
+    data_file.write_text("not a directory")
+    paths = AppPaths(data_file, tmp_path / "cache")
+    body = b"%PDF-1.7\nfixture"
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/pdf"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+
+    assert error.value.code == "storage_install"
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+    assert data_file.read_text() == "not a directory"
+
+
+def test_download_keeps_installed_object_when_directory_fsync_fails(tmp_path, monkeypatch) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    body = b"%PDF-1.7\nfixture"
+    real_fsync = downloader.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError(errno.EIO, "I/O error")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(downloader.os, "fsync", fail_directory_fsync)
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/pdf"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+
+    sha256 = hashlib.sha256(body).hexdigest()
+    destination = paths.objects_dir / sha256[:2] / sha256[2:4] / f"{sha256}.pdf"
+    assert error.value.code == "storage_install"
+    assert destination.read_bytes() == body
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
