@@ -7,8 +7,33 @@ import httpx
 
 from papers_cli import cli
 from papers_cli.db import Database
+from papers_cli.models import RemotePaper
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def local_paper(source_key: str = "2301.00001") -> RemotePaper:
+    return RemotePaper(
+        source="arxiv",
+        source_key=source_key,
+        source_version="2",
+        title="Fixture",
+        abstract="",
+        authors=[],
+        categories=[],
+        published_at=None,
+        updated_at=None,
+        doi=None,
+        landing_url=f"https://arxiv.org/abs/{source_key}v2",
+        pdf_url=f"https://arxiv.org/pdf/{source_key}v2",
+    )
+
+
+def seed_database(data_dir: Path, paper: RemotePaper) -> None:
+    data_dir.mkdir()
+    database = Database(data_dir / "papers.sqlite3")
+    database.upsert_paper(paper)
+    database.close()
 
 
 def test_download_then_verify_has_stable_json(monkeypatch, tmp_path, capsys) -> None:
@@ -91,6 +116,97 @@ def test_remote_lookup_does_not_create_collection_state(monkeypatch, tmp_path, c
 
     assert cli.main(["lookup", "arxiv:2301.00001", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["data"]["ref"] == "arxiv:2301.00001"
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
+def test_dry_run_existing_database_does_not_create_wal_artifacts(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    real_client = httpx.Client
+
+    def mock_client(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    seed_database(data_dir, local_paper())
+    assert sorted(path.name for path in data_dir.iterdir()) == ["papers.sqlite3"]
+    monkeypatch.setattr(cli.httpx, "Client", mock_client)
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["download", "arxiv:2301.00001", "--dry-run", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"][0]["dry_run"] is True
+    assert sorted(path.name for path in data_dir.iterdir()) == ["papers.sqlite3"]
+    assert not cache_dir.exists()
+
+
+def test_remote_lookup_existing_database_does_not_create_wal_artifacts(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    real_client = httpx.Client
+
+    def mock_client(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    seed_database(data_dir, local_paper("2301.00002"))
+    assert sorted(path.name for path in data_dir.iterdir()) == ["papers.sqlite3"]
+    monkeypatch.setattr(cli.httpx, "Client", mock_client)
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["lookup", "arxiv:2301.00001", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["ref"] == "arxiv:2301.00001"
+    assert sorted(path.name for path in data_dir.iterdir()) == ["papers.sqlite3"]
+    assert not cache_dir.exists()
+
+
+def test_unsupported_remote_search_does_not_create_collection_state(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["search", "--source", "unknown", "--query", "test", "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "unknown_source"
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
+def test_remote_search_does_not_create_collection_state(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    real_client = httpx.Client
+
+    def mock_client(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setattr(cli.httpx, "Client", mock_client)
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["search", "--source", "arxiv", "--query", "fixture", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"][0]["ref"] == "arxiv:2301.00001"
     assert not data_dir.exists()
     assert not cache_dir.exists()
 

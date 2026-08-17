@@ -18,7 +18,9 @@ def _now() -> str:
 class Database:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         if read_only:
-            self.connection = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True)
+            self.connection = sqlite3.connect(
+                f"{path.absolute().as_uri()}?mode=ro&immutable=1", uri=True
+            )
         else:
             self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row

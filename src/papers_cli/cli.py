@@ -146,6 +146,12 @@ def execute(args: argparse.Namespace) -> object:
         return list(source_capabilities())
 
     paths = get_paths()
+    if args.command == "search":
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+            results = adapter_for(args.source.lower()).search(args.query, args.limit, client)
+            return [paper.as_dict() for paper in results]
+
     if args.command == "lookup":
         database = (
             Database(paths.database_path, read_only=True) if paths.database_path.is_file() else None
@@ -200,9 +206,6 @@ def execute(args: argparse.Namespace) -> object:
 
         timeout = httpx.Timeout(30.0, connect=10.0)
         with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
-            if args.command == "search":
-                results = adapter_for(args.source.lower()).search(args.query, args.limit, client)
-                return [paper.as_dict() for paper in results]
             if args.command == "download":
                 results = []
                 for ref in args.refs:
