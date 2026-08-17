@@ -146,3 +146,15 @@ def test_attach_file_uses_canonical_id_after_digest_race(tmp_path) -> None:
     assert attached_id == canonical_id
     database.close()
     competitor.close()
+
+
+def test_read_only_database_observes_committed_active_wal(tmp_path) -> None:
+    path = tmp_path / "papers.sqlite3"
+    writer = Database(path)
+    paper_id = writer.upsert_paper(sample_paper())
+    assert path.with_name("papers.sqlite3-wal").exists()
+
+    reader = Database(path, read_only=True)
+    assert reader.get(paper_id)["ref"] == "arxiv:2301.00001"
+    reader.close()
+    writer.close()

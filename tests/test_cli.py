@@ -174,6 +174,33 @@ def test_remote_lookup_existing_database_does_not_create_wal_artifacts(
     assert not cache_dir.exists()
 
 
+def test_lookup_and_dry_run_observe_committed_active_wal(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    real_client = httpx.Client
+
+    def mock_client(**kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    writer = Database(data_dir / "papers.sqlite3")
+    paper_id = writer.upsert_paper(local_paper())
+    assert (data_dir / "papers.sqlite3-wal").exists()
+    monkeypatch.setattr(cli.httpx, "Client", mock_client)
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(tmp_path / "cache"))
+
+    assert cli.main(["lookup", paper_id, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["id"] == paper_id
+    assert cli.main(["download", paper_id, "--dry-run", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"][0]["ref"] == "arxiv:2301.00001"
+    writer.close()
+
+
 def test_unsupported_remote_search_does_not_create_collection_state(
     monkeypatch, tmp_path, capsys
 ) -> None:

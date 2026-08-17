@@ -18,9 +18,12 @@ def _now() -> str:
 class Database:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
         if read_only:
-            self.connection = sqlite3.connect(
-                f"{path.absolute().as_uri()}?mode=ro&immutable=1", uri=True
+            # SQLite needs its normal readonly VFS to observe committed records in an active WAL.
+            # Without a WAL, immutable mode avoids creating a sidecar pair merely to read.
+            query = (
+                "mode=ro" if path.with_name(f"{path.name}-wal").exists() else "mode=ro&immutable=1"
             )
+            self.connection = sqlite3.connect(f"{path.absolute().as_uri()}?{query}", uri=True)
         else:
             self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row

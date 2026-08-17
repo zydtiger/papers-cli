@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from collections.abc import Sequence
 
@@ -153,10 +154,13 @@ def execute(args: argparse.Namespace) -> object:
             return [paper.as_dict() for paper in results]
 
     if args.command == "lookup":
-        database = (
-            Database(paths.database_path, read_only=True) if paths.database_path.is_file() else None
-        )
+        database = None
         try:
+            database = (
+                Database(paths.database_path, read_only=True)
+                if paths.database_path.is_file()
+                else None
+            )
             if database is not None:
                 try:
                     return database.get(args.ref)
@@ -167,21 +171,32 @@ def execute(args: argparse.Namespace) -> object:
             timeout = httpx.Timeout(30.0, connect=10.0)
             with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
                 return adapter.lookup(raw, client).as_dict()
+        except sqlite3.Error as error:
+            raise PapersError(
+                "storage_unavailable", "Unable to read the local collection", exit_code=5
+            ) from error
         finally:
             if database is not None:
                 database.close()
 
     if args.command == "download" and args.dry_run:
-        database = (
-            Database(paths.database_path, read_only=True) if paths.database_path.is_file() else None
-        )
+        database = None
         try:
+            database = (
+                Database(paths.database_path, read_only=True)
+                if paths.database_path.is_file()
+                else None
+            )
             timeout = httpx.Timeout(30.0, connect=10.0)
             with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
                 return [
                     {"ref": paper.ref, "dry_run": True, "pdf_url": paper.pdf_url}
                     for paper in (_get_remote(ref, database, client) for ref in args.refs)
                 ]
+        except sqlite3.Error as error:
+            raise PapersError(
+                "storage_unavailable", "Unable to read the local collection", exit_code=5
+            ) from error
         finally:
             if database is not None:
                 database.close()
