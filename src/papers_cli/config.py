@@ -23,9 +23,9 @@ class AppPaths:
         return self.data_dir / "objects" / "sha256"
 
     @property
-    def staging_dir(self) -> Path:
-        # Staging is intentionally in data: atomic replacement requires the same filesystem.
-        return self.data_dir / ".staging"
+    def download_cache_dir(self) -> Path:
+        """Return the disposable cache location for incomplete PDF downloads."""
+        return self.cache_dir / "downloads"
 
 
 def _override(name: str) -> Path | None:
@@ -50,4 +50,3 @@ def ensure_paths(paths: AppPaths) -> None:
     paths.data_dir.mkdir(parents=True, exist_ok=True)
     paths.cache_dir.mkdir(parents=True, exist_ok=True)
     paths.objects_dir.mkdir(parents=True, exist_ok=True)
-    paths.staging_dir.mkdir(parents=True, exist_ok=True)

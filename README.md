@@ -34,6 +34,8 @@ objects/sha256/ab/cd/<full-sha256>.pdf
 
 The downloader accepts only adapter-supplied HTTPS URLs, revalidates every redirect against an allowlist, limits downloads to 100 MiB, checks the PDF signature, calculates SHA-256 while streaming, `fsync`s, and atomically publishes the object. Existing digests are reused.
 
+Incomplete downloads live in the disposable cache as `downloads/download-*.part`. After validation and `fsync`, Papers CLI atomically moves the part into the data directory's content-addressed object tree. This installation assumes the configured cache and data directories are on the same filesystem.
+
 Runtime paths:
 
 - macOS data: `~/Library/Application Support/papers-cli`; cache: `~/Library/Caches/papers-cli`

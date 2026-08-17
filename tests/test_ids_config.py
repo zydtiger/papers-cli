@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from papers_cli.config import get_paths
+from papers_cli.config import AppPaths, ensure_paths, get_paths
 from papers_cli.errors import PapersError
 from papers_cli.ids import uuid7
 
@@ -21,6 +21,14 @@ def test_paths_honor_absolute_overrides(monkeypatch: pytest.MonkeyPatch, tmp_pat
     paths = get_paths()
     assert paths.data_dir == tmp_path / "data"
     assert paths.cache_dir == tmp_path / "cache"
+    assert paths.download_cache_dir == tmp_path / "cache" / "downloads"
+
+
+def test_path_initialization_does_not_create_data_staging_directory(tmp_path) -> None:
+    configured = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(configured)
+    assert not (configured.data_dir / ".staging").exists()
+    assert not configured.download_cache_dir.exists()
 
 
 def test_paths_reject_relative_override(monkeypatch: pytest.MonkeyPatch) -> None:

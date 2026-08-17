@@ -97,9 +97,9 @@ def download_pdf(
 
 
 def _store_stream(response: httpx.Response, source_url: str, paths: AppPaths) -> DownloadedFile:
-    paths.staging_dir.mkdir(parents=True, exist_ok=True)
+    paths.download_cache_dir.mkdir(parents=True, exist_ok=True)
     descriptor, staging_name = tempfile.mkstemp(
-        prefix="download-", suffix=".part", dir=paths.staging_dir
+        prefix="download-", suffix=".part", dir=paths.download_cache_dir
     )
     staging = Path(staging_name)
     digest = hashlib.sha256()
@@ -132,12 +132,19 @@ def _store_stream(response: httpx.Response, source_url: str, paths: AppPaths) ->
         if destination.exists():
             staging.unlink()
         else:
-            os.replace(staging, destination)
-            parent_fd = os.open(destination.parent, os.O_RDONLY)
             try:
-                os.fsync(parent_fd)
-            finally:
-                os.close(parent_fd)
+                os.replace(staging, destination)
+                parent_fd = os.open(destination.parent, os.O_RDONLY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            except OSError as exc:
+                raise PapersError(
+                    "storage_install",
+                    "Unable to atomically install the verified PDF",
+                    exit_code=5,
+                ) from exc
         return DownloadedFile(
             sha256=sha256, byte_count=size, relative_path=relative.as_posix(), source_url=source_url
         )
