@@ -64,8 +64,8 @@ Live-provider smoke checks are intentionally not part of the test suite.
 After this repository has a published location, install the committed root skill globally in file mode (do not run this against an unknown remote):
 
 ```sh
-skillctl add --global REPOSITORY --file SKILL.md --name papers-cli-skill --ref main
+skillctl add --global https://github.com/zydtiger/papers-cli.git --file SKILL.md --name papers-cli-skill --ref main
 skillctl update --global papers-cli-skill
 ```
 
-`REPOSITORY` is deliberately a placeholder: this project does not create or configure remotes. The root `SKILL.md` is a single-file source so file-mode installation has no external resource dependency.
+The root `SKILL.md` is a single-file source so file-mode installation has no external resource dependency.
