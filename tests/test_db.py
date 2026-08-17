@@ -6,6 +6,32 @@ from papers_cli.db import Database
 from papers_cli.models import DownloadedFile, RemotePaper
 
 
+class RaceInjectingConnection:
+    """Inject a second writer immediately before the first insert executes."""
+
+    def __init__(self, connection, competitor: Database, paper: RemotePaper) -> None:
+        self._connection = connection
+        self._competitor = competitor
+        self._paper = paper
+        self._injected = False
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self._connection.__exit__(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def execute(self, sql, parameters=()):
+        if not self._injected and "INSERT INTO papers" in sql:
+            self._injected = True
+            self._competitor.upsert_paper(self._paper)
+        return self._connection.execute(sql, parameters)
+
+
 def sample_paper() -> RemotePaper:
     return RemotePaper(
         source="arxiv",
@@ -41,3 +67,25 @@ def test_upsert_keeps_uuid7_and_deduplicates_file(tmp_path) -> None:
         "source_url": file.source_url,
     }
     database.close()
+
+
+def test_upsert_returns_canonical_id_after_insert_race(tmp_path) -> None:
+    path = tmp_path / "papers.sqlite3"
+    database = Database(path)
+    competitor = Database(path)
+    paper = sample_paper()
+    database.connection = RaceInjectingConnection(database.connection, competitor, paper)  # type: ignore[assignment]
+
+    canonical_id = database.upsert_paper(paper)
+    file = DownloadedFile(
+        "b" * 64,
+        12,
+        "objects/sha256/bb/bb/" + "b" * 64 + ".pdf",
+        "https://arxiv.org/pdf/x",
+    )
+    database.attach_file(canonical_id, file, "2")
+
+    assert canonical_id == competitor.get("arxiv:2301.00001")["id"]
+    assert database.get(canonical_id)["file"] is not None
+    database.close()
+    competitor.close()

@@ -74,7 +74,10 @@ def _remote_from_local(record: dict[str, object]) -> RemotePaper:
     )
 
 
-def _get_remote(ref: str, database: Database, client: httpx.Client) -> RemotePaper:
+def _get_remote(ref: str, database: Database | None, client: httpx.Client) -> RemotePaper:
+    if database is None:
+        adapter, raw = infer_adapter(ref)
+        return adapter.lookup(raw, client)
     try:
         local = database.get(ref)
     except PapersError as error:
@@ -86,8 +89,17 @@ def _get_remote(ref: str, database: Database, client: httpx.Client) -> RemotePap
     return adapter_for(local_remote.source).lookup(local_remote.source_key, client)
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+class PapersArgumentParser(argparse.ArgumentParser):
+    json_requested = False
+
+    def error(self, message: str) -> None:
+        if self.json_requested:
+            raise PapersError("usage", message, exit_code=2)
+        super().error(message)
+
+
+def build_parser() -> PapersArgumentParser:
+    parser = PapersArgumentParser(
         prog="papers", description="Find and verify official research PDFs."
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -134,6 +146,21 @@ def execute(args: argparse.Namespace) -> object:
         return list(source_capabilities())
 
     paths = get_paths()
+    if args.command == "download" and args.dry_run:
+        database = (
+            Database(paths.database_path, read_only=True) if paths.database_path.is_file() else None
+        )
+        try:
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+                return [
+                    {"ref": paper.ref, "dry_run": True, "pdf_url": paper.pdf_url}
+                    for paper in (_get_remote(ref, database, client) for ref in args.refs)
+                ]
+        finally:
+            if database is not None:
+                database.close()
+
     ensure_paths(paths)
     database = Database(paths.database_path)
     try:
@@ -169,11 +196,6 @@ def execute(args: argparse.Namespace) -> object:
                 results = []
                 for ref in args.refs:
                     paper = _get_remote(ref, database, client)
-                    if args.dry_run:
-                        results.append(
-                            {"ref": paper.ref, "dry_run": True, "pdf_url": paper.pdf_url}
-                        )
-                        continue
                     adapter = adapter_for(paper.source)
                     downloaded = download_pdf(client, paper.pdf_url, adapter.allowed_hosts, paths)
                     paper_id = database.upsert_paper(paper)
@@ -187,9 +209,12 @@ def execute(args: argparse.Namespace) -> object:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
-    as_json = bool(getattr(args, "json", False))
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    PapersArgumentParser.json_requested = "--json" in arguments
+    as_json = parser.json_requested
     try:
+        args = parser.parse_args(arguments)
+        as_json = bool(getattr(args, "json", False))
         _render(execute(args), as_json)
         return 0
     except PapersError as error:

@@ -16,13 +16,17 @@ def _now() -> str:
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
-        self.connection = sqlite3.connect(path)
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        if read_only:
+            self.connection = sqlite3.connect(f"{path.absolute().as_uri()}?mode=ro", uri=True)
+        else:
+            self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
-        self.connection.execute("PRAGMA journal_mode = WAL")
-        self._initialize()
+        if not read_only:
+            self.connection.execute("PRAGMA journal_mode = WAL")
+            self._initialize()
 
     def close(self) -> None:
         self.connection.close()
@@ -87,11 +91,7 @@ class Database:
 
     def upsert_paper(self, paper: RemotePaper) -> str:
         now = _now()
-        existing = self.connection.execute(
-            "SELECT id FROM papers WHERE source = ? AND source_key = ?",
-            (paper.source, paper.source_key),
-        ).fetchone()
-        paper_id = str(existing["id"]) if existing else uuid7()
+        candidate_id = uuid7()
         with self.connection:
             self.connection.execute(
                 """
@@ -115,7 +115,7 @@ class Database:
                   refreshed_at=excluded.refreshed_at
                 """,
                 (
-                    paper_id,
+                    candidate_id,
                     paper.source,
                     paper.source_key,
                     paper.source_version,
@@ -132,6 +132,15 @@ class Database:
                     now,
                 ),
             )
+            row = self.connection.execute(
+                "SELECT id FROM papers WHERE source = ? AND source_key = ?",
+                (paper.source, paper.source_key),
+            ).fetchone()
+            if row is None:
+                raise PapersError(
+                    "storage_corrupt", "Paper upsert did not persist a record", exit_code=5
+                )
+            paper_id = str(row["id"])
             for scheme, value in self._aliases(paper):
                 self.connection.execute(
                     """INSERT OR IGNORE INTO aliases
