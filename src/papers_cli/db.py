@@ -151,17 +151,22 @@ class Database:
 
     def attach_file(self, paper_id: str, file: DownloadedFile, source_version: str | None) -> None:
         now = _now()
-        existing = self.connection.execute(
-            "SELECT id FROM files WHERE sha256 = ?", (file.sha256,)
-        ).fetchone()
-        file_id = str(existing["id"]) if existing else uuid7()
+        candidate_id = uuid7()
         with self.connection:
             self.connection.execute(
                 """INSERT OR IGNORE INTO files
                 (id, sha256, media_type, byte_count, relative_path, created_at)
                 VALUES (?, ?, 'application/pdf', ?, ?, ?)""",
-                (file_id, file.sha256, file.byte_count, file.relative_path, now),
+                (candidate_id, file.sha256, file.byte_count, file.relative_path, now),
             )
+            row = self.connection.execute(
+                "SELECT id FROM files WHERE sha256 = ?", (file.sha256,)
+            ).fetchone()
+            if row is None:
+                raise PapersError(
+                    "storage_corrupt", "File upsert did not persist a record", exit_code=5
+                )
+            file_id = str(row["id"])
             self.connection.execute(
                 "DELETE FROM paper_files WHERE paper_id = ? AND role = 'pdf'", (paper_id,)
             )
@@ -229,12 +234,15 @@ class Database:
             raise PapersError("not_found", f"No local paper matches {ref}", exit_code=3)
         return self._row_to_dict(row)
 
-    def list(self, source: str | None, limit: int) -> list[dict[str, object]]:
+    def list(self, source: str | None, limit: int | None) -> list[dict[str, object]]:
         query = self._select()
         params: tuple[object, ...] = ()
         if source:
             query += " WHERE p.source = ?"
             params = (source,)
-        query += " ORDER BY p.created_at DESC, p.id DESC LIMIT ?"
-        rows = self.connection.execute(query, (*params, limit)).fetchall()
+        query += " ORDER BY p.created_at DESC, p.id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (*params, limit)
+        rows = self.connection.execute(query, params).fetchall()
         return [self._row_to_dict(row) for row in rows]

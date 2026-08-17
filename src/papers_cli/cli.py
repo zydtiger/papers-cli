@@ -146,6 +146,25 @@ def execute(args: argparse.Namespace) -> object:
         return list(source_capabilities())
 
     paths = get_paths()
+    if args.command == "lookup":
+        database = (
+            Database(paths.database_path, read_only=True) if paths.database_path.is_file() else None
+        )
+        try:
+            if database is not None:
+                try:
+                    return database.get(args.ref)
+                except PapersError as error:
+                    if error.code != "not_found":
+                        raise
+            adapter, raw = infer_adapter(args.ref)
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+                return adapter.lookup(raw, client).as_dict()
+        finally:
+            if database is not None:
+                database.close()
+
     if args.command == "download" and args.dry_run:
         database = (
             Database(paths.database_path, read_only=True) if paths.database_path.is_file() else None
@@ -169,7 +188,7 @@ def execute(args: argparse.Namespace) -> object:
         if args.command == "path":
             return str(local_path(paths, database.get(args.ref)))
         if args.command == "verify":
-            records = database.list(None, 10_000) if args.all else [database.get(args.ref)]
+            records = database.list(None, None) if args.all else [database.get(args.ref)]
             results = [verify_file(paths, record) for record in records]
             if args.all:
                 return {
@@ -184,14 +203,6 @@ def execute(args: argparse.Namespace) -> object:
             if args.command == "search":
                 results = adapter_for(args.source.lower()).search(args.query, args.limit, client)
                 return [paper.as_dict() for paper in results]
-            if args.command == "lookup":
-                try:
-                    return database.get(args.ref)
-                except PapersError as error:
-                    if error.code != "not_found":
-                        raise
-                    adapter, raw = infer_adapter(args.ref)
-                    return adapter.lookup(raw, client).as_dict()
             if args.command == "download":
                 results = []
                 for ref in args.refs:
