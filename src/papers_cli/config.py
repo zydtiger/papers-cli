@@ -47,6 +47,11 @@ def get_paths() -> AppPaths:
 
 
 def ensure_paths(paths: AppPaths) -> None:
-    paths.data_dir.mkdir(parents=True, exist_ok=True)
-    paths.cache_dir.mkdir(parents=True, exist_ok=True)
-    paths.objects_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        paths.data_dir.mkdir(parents=True, exist_ok=True)
+        paths.cache_dir.mkdir(parents=True, exist_ok=True)
+        paths.objects_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PapersError(
+            "storage_initialize", "Unable to initialize the local collection", exit_code=5
+        ) from exc

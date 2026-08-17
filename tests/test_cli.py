@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import httpx
+import pytest
 
 from papers_cli import cli
 from papers_cli.db import Database
@@ -94,6 +95,29 @@ def test_download_staging_failure_has_stable_json(monkeypatch, tmp_path, capsys)
     output = json.loads(capsys.readouterr().out)
     assert output["ok"] is False
     assert output["error"]["code"] == "storage_staging"
+
+
+@pytest.mark.parametrize("blocked_override", ["PAPERS_CLI_DATA_DIR", "PAPERS_CLI_CACHE_DIR"])
+def test_download_path_initialization_failure_has_stable_json(
+    monkeypatch, tmp_path, capsys, blocked_override
+) -> None:
+    blocked_path = tmp_path / "blocked"
+    blocked_path.write_text("not a directory")
+    monkeypatch.setenv(blocked_override, str(blocked_path))
+    other_override = (
+        "PAPERS_CLI_CACHE_DIR"
+        if blocked_override == "PAPERS_CLI_DATA_DIR"
+        else "PAPERS_CLI_DATA_DIR"
+    )
+    monkeypatch.setenv(other_override, str(tmp_path / "other"))
+
+    assert cli.main(["download", "arxiv:2301.00001", "--json"]) == 5
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+    assert output_text.count("\n") == 1
+    assert output["schema_version"] == 1
+    assert output["ok"] is False
+    assert output["error"]["code"] == "storage_initialize"
 
 
 def test_dry_run_does_not_create_collection_state(monkeypatch, tmp_path, capsys) -> None:
