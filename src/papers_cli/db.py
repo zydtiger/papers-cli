@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -251,3 +252,90 @@ class Database:
             params = (*params, limit)
         rows = self.connection.execute(query, params).fetchall()
         return [self._row_to_dict(row) for row in rows]
+
+    def removal_plan(self, ref: str) -> dict[str, object]:
+        paper = self.get(ref)
+        paper_id = str(paper["id"])
+        rows = self.connection.execute(
+            """
+            SELECT f.id, f.sha256, f.byte_count, f.relative_path,
+                   COUNT(all_links.paper_id) AS reference_count
+            FROM paper_files target
+            JOIN files f ON f.id = target.file_id
+            LEFT JOIN paper_files all_links ON all_links.file_id = f.id
+            WHERE target.paper_id = ?
+            GROUP BY f.id, f.sha256, f.byte_count, f.relative_path
+            ORDER BY f.id
+            """,
+            (paper_id,),
+        ).fetchall()
+        files = [
+            {
+                "id": str(row["id"]),
+                "sha256": str(row["sha256"]),
+                "byte_count": int(row["byte_count"]),
+                "relative_path": str(row["relative_path"]),
+                "reference_count": int(row["reference_count"]),
+            }
+            for row in rows
+        ]
+        return {
+            "paper": {"id": paper_id, "ref": paper["ref"], "title": paper["title"]},
+            "files": files,
+        }
+
+    def remove_paper(
+        self,
+        ref: str,
+        validate: Callable[[dict[str, object]], None],
+    ) -> dict[str, object]:
+        """Remove a paper and unreferenced file rows in one write transaction."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            plan = self.removal_plan(ref)
+            validate(plan)
+            paper = plan["paper"]
+            files = plan["files"]
+            if not isinstance(paper, dict) or not isinstance(files, list):
+                raise PapersError("storage_corrupt", "Removal plan is invalid", exit_code=5)
+            self.connection.execute("DELETE FROM papers WHERE id = ?", (paper["id"],))
+            for file in files:
+                if not isinstance(file, dict):
+                    raise PapersError("storage_corrupt", "Removal plan is invalid", exit_code=5)
+                cursor = self.connection.execute(
+                    """
+                    DELETE FROM files
+                    WHERE id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM paper_files WHERE file_id = files.id
+                      )
+                    """,
+                    (file["id"],),
+                )
+                file["catalog_action"] = (
+                    "delete_object" if cursor.rowcount == 1 else "retain_shared"
+                )
+            self.connection.commit()
+            return plan
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def remove_object_if_unreferenced(
+        self, sha256: str, remove: Callable[[], str]
+    ) -> tuple[bool, str | None]:
+        """Run an object unlink callback while preventing new file references."""
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT 1 FROM files WHERE sha256 = ?", (sha256,)
+            ).fetchone()
+            if row is not None:
+                self.connection.rollback()
+                return False, None
+            disposition = remove()
+            self.connection.rollback()
+            return True, disposition
+        except Exception:
+            self.connection.rollback()
+            raise
