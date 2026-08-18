@@ -11,4 +11,6 @@ Treat downloading a PDF as an external side effect. Obtain the user's approval b
 
 Use `papers lookup REF --json` before download when metadata or provenance needs confirmation. After acquisition, use `papers path REF` to retrieve the local path and `papers verify REF --json` to check the stored digest. Use `papers verify --all --json` for a collection audit.
 
+Use `papers remove REF --dry-run --json` to inspect a local removal before changing collection state. Removal accepts a local UUID or stored alias and never performs a provider lookup. Obtain the user's approval before running `papers remove REF --json`: it permanently removes the selected paper metadata and deletes its PDF only when the content-addressed object is not shared by another paper. There is no trash, undo, or restore command.
+
 Do not pass arbitrary PDF URLs to the CLI. The CLI downloads only official, provider-approved URLs and stores verified content-addressed files locally.

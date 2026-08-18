@@ -14,7 +14,7 @@ from .downloader import download_pdf
 from .errors import PapersError
 from .models import RemotePaper
 from .sources import adapter_for, infer_adapter, source_capabilities
-from .storage import local_path, verify_file
+from .storage import local_path, remove_local, verify_file
 
 SCHEMA_VERSION = 1
 
@@ -132,6 +132,11 @@ def build_parser() -> PapersArgumentParser:
     path.add_argument("ref")
     path.add_argument("--json", action="store_true")
 
+    remove = commands.add_parser("remove", help="Remove a paper from the local collection")
+    remove.add_argument("ref")
+    remove.add_argument("--dry-run", action="store_true")
+    remove.add_argument("--json", action="store_true")
+
     verify = commands.add_parser("verify", help="Verify downloaded PDFs")
     verify_target = verify.add_mutually_exclusive_group(required=True)
     verify_target.add_argument("ref", nargs="?")
@@ -196,6 +201,21 @@ def execute(args: argparse.Namespace) -> object:
         except sqlite3.Error as error:
             raise PapersError(
                 "storage_unavailable", "Unable to read the local collection", exit_code=5
+            ) from error
+        finally:
+            if database is not None:
+                database.close()
+
+    if args.command == "remove":
+        if not paths.database_path.is_file():
+            raise PapersError("not_found", f"No local paper matches {args.ref}", exit_code=3)
+        database = None
+        try:
+            database = Database(paths.database_path, read_only=args.dry_run)
+            return remove_local(paths, database, args.ref, dry_run=args.dry_run)
+        except sqlite3.Error as error:
+            raise PapersError(
+                "storage_unavailable", "Unable to update the local collection", exit_code=5
             ) from error
         finally:
             if database is not None:

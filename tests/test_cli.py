@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -8,7 +9,8 @@ import pytest
 
 from papers_cli import cli
 from papers_cli.db import Database
-from papers_cli.models import RemotePaper
+from papers_cli.errors import PapersError
+from papers_cli.models import DownloadedFile, RemotePaper
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -35,6 +37,29 @@ def seed_database(data_dir: Path, paper: RemotePaper) -> None:
     database = Database(data_dir / "papers.sqlite3")
     database.upsert_paper(paper)
     database.close()
+
+
+def seed_downloaded_paper(
+    data_dir: Path,
+    paper: RemotePaper,
+    *,
+    sha256: str = "a" * 64,
+    body: bytes = b"%PDF-1.7\nfixture",
+) -> tuple[str, Path]:
+    data_dir.mkdir(exist_ok=True)
+    relative = Path("objects") / "sha256" / sha256[:2] / sha256[2:4] / f"{sha256}.pdf"
+    object_path = data_dir / relative
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_bytes(body)
+    database = Database(data_dir / "papers.sqlite3")
+    paper_id = database.upsert_paper(paper)
+    database.attach_file(
+        paper_id,
+        DownloadedFile(sha256, len(body), relative.as_posix(), paper.pdf_url),
+        paper.source_version,
+    )
+    database.close()
+    return paper_id, object_path
 
 
 def test_download_then_verify_has_stable_json(monkeypatch, tmp_path, capsys) -> None:
@@ -339,3 +364,220 @@ def test_verify_all_includes_more_than_ten_thousand_records(monkeypatch, tmp_pat
     assert isinstance(result, dict)
     assert result["total"] == 10_001
     assert result["verified"] == 10_001
+
+
+@pytest.mark.parametrize("use_alias", [False, True])
+def test_remove_accepts_uuid_or_local_alias_without_network(
+    monkeypatch, tmp_path, capsys, use_alias
+) -> None:
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    paper = local_paper()
+    paper_id, object_path = seed_downloaded_paper(data_dir, paper)
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+    monkeypatch.setattr(
+        cli.httpx,
+        "Client",
+        lambda **_: pytest.fail("remove must not create an HTTP client"),
+    )
+
+    ref = paper.ref if use_alias else paper_id
+    assert cli.main(["remove", ref, "--json"]) == 0
+    output_text = capsys.readouterr().out
+    output = json.loads(output_text)
+    assert output_text.count("\n") == 1
+    assert output["schema_version"] == 1
+    assert output["data"]["id"] == paper_id
+    assert output["data"]["objects"][0]["disposition"] == "deleted"
+    assert not object_path.exists()
+
+    assert cli.main(["path", ref, "--json"]) == 3
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "not_found"
+
+
+def test_remove_dry_run_is_read_only_and_reports_plan(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    paper = local_paper()
+    paper_id, object_path = seed_downloaded_paper(data_dir, paper)
+    assert sorted(path.name for path in data_dir.iterdir()) == ["objects", "papers.sqlite3"]
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["remove", paper_id, "--dry-run", "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["dry_run"] is True
+    assert output["data"]["objects"][0]["disposition"] == "would_delete"
+    assert object_path.is_file()
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.get(paper_id)["id"] == paper_id
+    database.close()
+    assert sorted(path.name for path in data_dir.iterdir()) == ["objects", "papers.sqlite3"]
+    assert not cache_dir.exists()
+
+
+def test_remove_dry_run_absent_collection_creates_nothing(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["remove", "arxiv:2301.00001", "--dry-run", "--json"]) == 3
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "not_found"
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
+def test_remove_retains_shared_object(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    first = local_paper("2301.00001")
+    first_id, object_path = seed_downloaded_paper(data_dir, first)
+    second = local_paper("2301.00002")
+    database = Database(data_dir / "papers.sqlite3")
+    second_id = database.upsert_paper(second)
+    file_record = database.get(first_id)["file"]
+    assert isinstance(file_record, dict)
+    database.attach_file(
+        second_id,
+        DownloadedFile(
+            str(file_record["sha256"]),
+            int(file_record["byte_count"]),
+            str(file_record["relative_path"]),
+            second.pdf_url,
+        ),
+        second.source_version,
+    )
+    database.close()
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["remove", first_id, "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["objects"][0]["disposition"] == "retained_shared"
+    assert object_path.is_file()
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.get(second_id)["file"] == file_record | {"source_url": second.pdf_url}
+    database.close()
+
+
+def test_remove_rechecks_new_reference_before_unlink(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    cache_dir = tmp_path / "cache"
+    first = local_paper("2301.00001")
+    first_id, object_path = seed_downloaded_paper(data_dir, first)
+    second = local_paper("2301.00002")
+    relative = object_path.relative_to(data_dir).as_posix()
+    original = Database.remove_object_if_unreferenced
+    second_id: str | None = None
+
+    def attach_before_guard(self, sha256, remove):
+        nonlocal second_id
+        competitor = Database(data_dir / "papers.sqlite3")
+        second_id = competitor.upsert_paper(second)
+        competitor.attach_file(
+            second_id,
+            DownloadedFile(sha256, object_path.stat().st_size, relative, second.pdf_url),
+            second.source_version,
+        )
+        competitor.close()
+        return original(self, sha256, remove)
+
+    monkeypatch.setattr(Database, "remove_object_if_unreferenced", attach_before_guard)
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
+
+    assert cli.main(["remove", first_id, "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["objects"][0]["disposition"] == "retained_shared"
+    assert object_path.is_file()
+    assert second_id is not None
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.get(second_id)["file"] is not None
+    database.close()
+
+
+def test_remove_cleans_metadata_for_already_missing_object(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    paper_id, object_path = seed_downloaded_paper(data_dir, local_paper())
+    object_path.unlink()
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(tmp_path / "cache"))
+
+    assert cli.main(["remove", paper_id, "--json"]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["data"]["objects"][0]["disposition"] == "already_missing"
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    with pytest.raises(PapersError, match="No local paper"):
+        database.get(paper_id)
+    database.close()
+
+
+def test_remove_unsafe_path_fails_before_mutation(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    paper_id, object_path = seed_downloaded_paper(data_dir, local_paper())
+    database = Database(data_dir / "papers.sqlite3")
+    with database.connection:
+        database.connection.execute("UPDATE files SET relative_path = ?", ("../outside.pdf",))
+    database.close()
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(tmp_path / "cache"))
+
+    assert cli.main(["remove", paper_id, "--json"]) == 5
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"]["code"] == "storage_corrupt"
+    assert object_path.is_file()
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.get(paper_id)["id"] == paper_id
+    database.close()
+
+
+def test_remove_filesystem_failure_is_normalized_without_live_record(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir = tmp_path / "data"
+    paper_id, object_path = seed_downloaded_paper(data_dir, local_paper())
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(tmp_path / "cache"))
+    real_unlink = Path.unlink
+
+    def fail_object_unlink(path: Path, *args, **kwargs) -> None:
+        if path == object_path:
+            raise PermissionError("blocked")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_object_unlink)
+
+    assert cli.main(["remove", paper_id, "--json"]) == 5
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"]["code"] == "storage_remove"
+    assert object_path.is_file()
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    with pytest.raises(PapersError, match="No local paper"):
+        database.get(paper_id)
+    database.close()
+
+
+def test_remove_database_failure_rolls_back_before_unlink(monkeypatch, tmp_path, capsys) -> None:
+    data_dir = tmp_path / "data"
+    paper_id, object_path = seed_downloaded_paper(data_dir, local_paper())
+    database = sqlite3.connect(data_dir / "papers.sqlite3")
+    database.execute(
+        """
+        CREATE TRIGGER reject_paper_delete BEFORE DELETE ON papers
+        BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END
+        """
+    )
+    database.commit()
+    database.close()
+    monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(tmp_path / "cache"))
+
+    assert cli.main(["remove", paper_id, "--json"]) == 5
+    output = json.loads(capsys.readouterr().out)
+    assert output["error"]["code"] == "storage_unavailable"
+    assert object_path.is_file()
+    database_wrapper = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database_wrapper.get(paper_id)["id"] == paper_id
+    database_wrapper.close()
