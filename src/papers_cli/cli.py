@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 from collections.abc import Sequence
+from typing import NoReturn
 
 import httpx
 
@@ -93,7 +94,7 @@ def _get_remote(ref: str, database: Database | None, client: httpx.Client) -> Re
 class PapersArgumentParser(argparse.ArgumentParser):
     json_requested = False
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         if self.json_requested:
             raise PapersError("usage", message, exit_code=2)
         super().error(message)
@@ -155,8 +156,8 @@ def execute(args: argparse.Namespace) -> object:
     if args.command == "search":
         timeout = httpx.Timeout(30.0, connect=10.0)
         with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
-            results = adapter_for(args.source.lower()).search(args.query, args.limit, client)
-            return [paper.as_dict() for paper in results]
+            found = adapter_for(args.source.lower()).search(args.query, args.limit, client)
+            return [paper.as_dict() for paper in found]
 
     if args.command == "lookup":
         database = None
@@ -230,27 +231,27 @@ def execute(args: argparse.Namespace) -> object:
             return str(local_path(paths, database.get(args.ref)))
         if args.command == "verify":
             records = database.list(None, None) if args.all else [database.get(args.ref)]
-            results = [verify_file(paths, record) for record in records]
+            verifications = [verify_file(paths, record) for record in records]
             if args.all:
                 return {
-                    "results": results,
-                    "verified": sum(result["ok"] is True for result in results),
-                    "total": len(results),
+                    "results": verifications,
+                    "verified": sum(result["ok"] is True for result in verifications),
+                    "total": len(verifications),
                 }
-            return results[0]
+            return verifications[0]
 
         timeout = httpx.Timeout(30.0, connect=10.0)
         with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
             if args.command == "download":
-                results = []
+                stored = []
                 for ref in args.refs:
                     paper = _get_remote(ref, database, client)
                     adapter = adapter_for(paper.source)
                     downloaded = download_pdf(client, paper.pdf_url, adapter.allowed_hosts, paths)
                     paper_id = database.upsert_paper(paper)
                     database.attach_file(paper_id, downloaded, paper.source_version)
-                    results.append(database.get(paper_id))
-                return results
+                    stored.append(database.get(paper_id))
+                return stored
     finally:
         database.close()
     raise AssertionError(f"Unhandled command {args.command}")

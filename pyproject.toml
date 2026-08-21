@@ -16,9 +16,10 @@ papers = "papers_cli.cli:main"
 
 [dependency-groups]
 dev = [
+  "mypy>=1.13,<2",
   "pytest>=8.3,<9",
-  "pyright>=1.1.390,<2",
   "ruff>=0.9,<1",
+  "types-defusedxml>=0.7,<1",
 ]
 
 [build-system]
@@ -38,7 +39,7 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
-[tool.pyright]
-pythonVersion = "3.12"
-typeCheckingMode = "basic"
-include = ["src", "tests"]
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+warn_unused_configs = true
