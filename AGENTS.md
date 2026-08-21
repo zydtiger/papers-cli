@@ -10,6 +10,7 @@
 
 - Use `uv` with Python 3.12 or later.
 - Run `uv run ruff check .`, `uv run pyright`, and `uv run pytest` for material changes.
+- Ruff and pyright are also enforced by the commit hooks in `.pre-commit-config.yaml`. Install the runner once per machine with `uv tool install prek` and activate it with `prek install`.
 - Tests must not require a live network; use mocked transports and fixtures.
 
 ## Git workflow
