@@ -36,9 +36,7 @@ jobs:
         run: uv sync --locked
 
       - name: Run commit hooks
-        run: |
-          uv tool install prek
-          prek run --all-files
+        run: uvx prek@0.4.14 run --all-files
 
       - name: Run tests
         run: uv run pytest
