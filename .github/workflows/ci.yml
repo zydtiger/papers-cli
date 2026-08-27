@@ -10,11 +10,44 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Install project
+        run: uv sync --locked
+
+      # Lint, format, type and lockfile checks do not depend on the interpreter
+      # in use (mypy targets a fixed python_version), so they run once here
+      # rather than once per matrix leg.
+      - name: Run commit hooks
+        uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        with:
+          prek-version: "0.4.x"
+
   test:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         python-version:
           - "3.12"
@@ -24,22 +57,34 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          cache-suffix: py${{ matrix.python-version }}
           python-version: ${{ matrix.python-version }}
-          version: "0.12.5"
 
       - name: Install project
         run: uv sync --locked
 
-      - name: Run commit hooks
-        run: uvx prek@0.4.14 run --all-files
+      - name: Run push-stage hooks
+        uses: j178/prek-action@4e14d07f9231acabce116ccfca13b13dd9755ece # v3.0.0
+        with:
+          prek-version: "0.4.x"
+          extra-args: --all-files --hook-stage pre-push
 
-      - name: Run tests
-        run: uv run pytest
-
+      # The wheel does not vary by interpreter, so build and smoke-test it on
+      # the lowest supported version only.
       - name: Build distributions
+        if: matrix.python-version == '3.12'
         run: uv build
+
+      - name: Install smoke test
+        if: matrix.python-version == '3.12'
+        run: |
+          uv venv "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/papers" --help

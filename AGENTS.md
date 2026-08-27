@@ -10,7 +10,9 @@
 
 - Use `uv` with Python 3.12 or later.
 - Run `uv run ruff check .`, `uv run mypy`, and `uv run pytest` for material changes.
-- Ruff and mypy are also enforced by the commit hooks in `.pre-commit-config.yaml`. Install the runner once per machine with `uv tool install prek` and activate it with `prek install`.
+- Ruff, mypy and lockfile consistency are enforced by the commit-stage hooks in `.pre-commit-config.yaml`, and pytest by the `pre-push` stage hook. Install the runner once per machine with `uv tool install prek` and activate it with `prek install`.
+- Mechanical scope is defined solely by `.pre-commit-config.yaml`; do not restate those commands or their scopes elsewhere.
+- CI (`.github/workflows/ci.yml`) invokes the same hook runner rather than restating hook commands: a `lint` job runs the commit-stage hooks once, and a matrixed `test` job runs the pre-push stage on every supported Python version, then builds and smoke-tests the wheel on the lowest one.
 - Tests must not require a live network; use mocked transports and fixtures.
 
 ## Git workflow

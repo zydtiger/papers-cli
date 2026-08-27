@@ -1,12 +1,33 @@
+minimum_prek_version: "0.4.14"
+default_install_hook_types: [pre-commit, pre-push, commit-msg]
+default_stages: [pre-commit]
+
 repos:
   - repo: builtin
     hooks:
       - id: check-added-large-files
+      - id: check-executables-have-shebangs
       - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: check-toml
       - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+      - id: require-pattern
+        name: commit message prefix
+        stages: [commit-msg]
+        args: ['^(Merge |(feat|fix|docs|refactor|test|build|ci|perf|chore|revert)(\([a-z0-9-]+\))?: [a-z])']
 
   - repo: local
     hooks:
+      - id: uv-lock-check
+        name: uv lock --check
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|uv\.lock)$
       - id: ruff-check
         name: ruff check
         entry: uv run ruff check
@@ -24,3 +45,10 @@ repos:
         language: system
         pass_filenames: false
         types_or: [python, pyi]
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        types_or: [python, pyi]
+        stages: [pre-push]
