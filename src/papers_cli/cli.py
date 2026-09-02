@@ -19,6 +19,29 @@ from .storage import local_path, remove_local, verify_file
 
 SCHEMA_VERSION = 1
 
+JSONL_HELP = "emit one versioned JSONL record per logical result"
+
+USAGE_EPILOG = (
+    "Machine-readable output: --jsonl emits one versioned JSON object per logical "
+    "result on stdout, in result order. An empty successful result set emits no "
+    "records. A usage or command-level failure emits exactly one error object and a "
+    "non-zero exit status. Machine summaries and handled command or usage errors are "
+    "not written to stderr, and verification summaries are reported in human mode "
+    "only."
+)
+
+MACHINE_CONTRACT_EPILOG = (
+    "Machine-readable output: --jsonl emits one versioned JSON object per logical "
+    "result on stdout, in result order. An empty success emits no records. A usage "
+    "or command-level failure emits exactly one error object and a non-zero exit "
+    "status. Machine summaries and handled command or usage errors are not written "
+    "to stderr."
+)
+
+VERIFY_CONTRACT_EPILOG = (
+    f"{MACHINE_CONTRACT_EPILOG} Verification summaries are reported in human mode only."
+)
+
 
 def _envelope(data: object) -> dict[str, object]:
     return {"schema_version": SCHEMA_VERSION, "ok": True, "data": data}
@@ -32,13 +55,24 @@ def _error(error: PapersError) -> dict[str, object]:
     }
 
 
-def _render(value: object, as_json: bool) -> None:
-    if as_json:
-        print(json.dumps(_envelope(value), sort_keys=True, separators=(",", ":")))
-    elif isinstance(value, str):
-        print(value)
-    else:
-        print(json.dumps(value, indent=2, sort_keys=True))
+def _render_jsonl(records: Sequence[object]) -> None:
+    for record in records:
+        print(json.dumps(_envelope(record), sort_keys=True, separators=(",", ":")))
+
+
+def _render_human(command: str, records: Sequence[object]) -> None:
+    if command == "verify":
+        verifications = [record for record in records if isinstance(record, dict)]
+        verified = sum(record.get("ok") is True for record in verifications)
+        for verification in verifications:
+            print(json.dumps(verification, indent=2, sort_keys=True))
+        print(f"Verified {verified} of {len(verifications)} papers.")
+        return
+    for record in records:
+        if isinstance(record, str):
+            print(record)
+        else:
+            print(json.dumps(record, indent=2, sort_keys=True))
 
 
 def _remote_from_local(record: dict[str, object]) -> RemotePaper:
@@ -91,64 +125,144 @@ def _get_remote(ref: str, database: Database | None, client: httpx.Client) -> Re
     return adapter_for(local_remote.source).lookup(local_remote.source_key, client)
 
 
+def _lookup_record(ref: str, database: Database | None, client: httpx.Client) -> dict[str, object]:
+    if database is not None:
+        try:
+            return database.get(ref)
+        except PapersError as error:
+            if error.code != "not_found":
+                raise
+    adapter, raw = infer_adapter(ref)
+    return adapter.lookup(raw, client).as_dict()
+
+
 class PapersArgumentParser(argparse.ArgumentParser):
-    json_requested = False
+    jsonl_requested = False
 
     def error(self, message: str) -> NoReturn:
-        if self.json_requested:
+        if self.jsonl_requested:
             raise PapersError("usage", message, exit_code=2)
         super().error(message)
 
 
 def build_parser() -> PapersArgumentParser:
     parser = PapersArgumentParser(
-        prog="papers", description="Find and verify official research PDFs."
+        prog="papers",
+        description="Find and verify official research PDFs.",
+        epilog=USAGE_EPILOG,
+        allow_abbrev=False,
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
-    sources = commands.add_parser("sources", help="List source capabilities")
-    sources.add_argument("--json", action="store_true")
+    sources = commands.add_parser(
+        "sources",
+        help="List source capabilities",
+        description="List installed source capabilities, one JSONL record per source.",
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
+    sources.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    search = commands.add_parser("search", help="Search a source")
+    search = commands.add_parser(
+        "search",
+        help="Search a source",
+        description="Search a source's official metadata, one JSONL record per result.",
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
     search.add_argument("--source", required=True)
     search.add_argument("--query", required=True)
     search.add_argument("--limit", type=int, default=10)
-    search.add_argument("--json", action="store_true")
+    search.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    lookup = commands.add_parser("lookup", help="Look up metadata")
-    lookup.add_argument("ref")
-    lookup.add_argument("--json", action="store_true")
+    lookup = commands.add_parser(
+        "lookup",
+        help="Look up metadata for one or more references in input order",
+        description=(
+            "Resolve each reference, in input order, against the local collection or "
+            "the source API, one JSONL record per reference; duplicates are preserved."
+        ),
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
+    lookup.add_argument("refs", nargs="+")
+    lookup.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    download = commands.add_parser("download", help="Download official PDFs")
+    download = commands.add_parser(
+        "download",
+        help="Download official PDFs",
+        description=(
+            "Download official PDFs for the given references, one JSONL record per "
+            "reference in input order."
+        ),
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
     download.add_argument("refs", nargs="+")
     download.add_argument("--dry-run", action="store_true")
-    download.add_argument("--json", action="store_true")
+    download.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    listing = commands.add_parser("list", help="List locally stored papers")
+    listing = commands.add_parser(
+        "list",
+        help="List locally stored papers",
+        description="List locally stored papers, one JSONL record per paper.",
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
     listing.add_argument("--source")
     listing.add_argument("--limit", type=int, default=100)
-    listing.add_argument("--json", action="store_true")
+    listing.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    path = commands.add_parser("path", help="Print a local PDF path")
-    path.add_argument("ref")
-    path.add_argument("--json", action="store_true")
+    path = commands.add_parser(
+        "path",
+        help="Print local PDF paths for one or more references in input order",
+        description=(
+            "Print the local PDF path for each reference in input order, one JSONL "
+            "record per reference."
+        ),
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
+    path.add_argument("refs", nargs="+")
+    path.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    remove = commands.add_parser("remove", help="Remove a paper from the local collection")
+    remove = commands.add_parser(
+        "remove",
+        help="Remove a paper from the local collection",
+        description=(
+            "Remove one paper from the local collection, emitting exactly one JSONL record."
+        ),
+        epilog=MACHINE_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
     remove.add_argument("ref")
     remove.add_argument("--dry-run", action="store_true")
-    remove.add_argument("--json", action="store_true")
+    remove.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
-    verify = commands.add_parser("verify", help="Verify downloaded PDFs")
-    verify_target = verify.add_mutually_exclusive_group(required=True)
-    verify_target.add_argument("ref", nargs="?")
-    verify_target.add_argument("--all", action="store_true")
-    verify.add_argument("--json", action="store_true")
+    verify = commands.add_parser(
+        "verify",
+        help="Verify downloaded PDFs for references or the whole collection",
+        description=(
+            "Verify stored PDFs for the given references or the whole collection, one "
+            "JSONL record per paper and no machine summary record."
+        ),
+        epilog=VERIFY_CONTRACT_EPILOG,
+        allow_abbrev=False,
+    )
+    verify.add_argument("refs", nargs="*")
+    verify.add_argument("--all", action="store_true")
+    verify.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
     return parser
 
 
-def execute(args: argparse.Namespace) -> object:
+def execute(args: argparse.Namespace) -> Sequence[object]:
     if getattr(args, "limit", 1) < 1 or getattr(args, "limit", 1) > 100:
         raise PapersError("invalid_limit", "--limit must be between 1 and 100", exit_code=2)
+    if args.command == "verify":
+        if args.all and args.refs:
+            raise PapersError("usage", "--all cannot be combined with references", exit_code=2)
+        if not args.all and not args.refs:
+            raise PapersError("usage", "verify requires references or --all", exit_code=2)
     if args.command == "sources":
         return list(source_capabilities())
 
@@ -167,16 +281,9 @@ def execute(args: argparse.Namespace) -> object:
                 if paths.database_path.is_file()
                 else None
             )
-            if database is not None:
-                try:
-                    return database.get(args.ref)
-                except PapersError as error:
-                    if error.code != "not_found":
-                        raise
-            adapter, raw = infer_adapter(args.ref)
             timeout = httpx.Timeout(30.0, connect=10.0)
             with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
-                return adapter.lookup(raw, client).as_dict()
+                return [_lookup_record(ref, database, client) for ref in args.refs]
         except sqlite3.Error as error:
             raise PapersError(
                 "storage_unavailable", "Unable to read the local collection", exit_code=5
@@ -213,7 +320,7 @@ def execute(args: argparse.Namespace) -> object:
         database = None
         try:
             database = Database(paths.database_path, read_only=args.dry_run)
-            return remove_local(paths, database, args.ref, dry_run=args.dry_run)
+            return [remove_local(paths, database, args.ref, dry_run=args.dry_run)]
         except sqlite3.Error as error:
             raise PapersError(
                 "storage_unavailable", "Unable to update the local collection", exit_code=5
@@ -228,17 +335,12 @@ def execute(args: argparse.Namespace) -> object:
         if args.command == "list":
             return database.list(args.source, args.limit)
         if args.command == "path":
-            return str(local_path(paths, database.get(args.ref)))
+            return [str(local_path(paths, database.get(ref))) for ref in args.refs]
         if args.command == "verify":
-            records = database.list(None, None) if args.all else [database.get(args.ref)]
-            verifications = [verify_file(paths, record) for record in records]
-            if args.all:
-                return {
-                    "results": verifications,
-                    "verified": sum(result["ok"] is True for result in verifications),
-                    "total": len(verifications),
-                }
-            return verifications[0]
+            records = (
+                database.list(None, None) if args.all else [database.get(ref) for ref in args.refs]
+            )
+            return [verify_file(paths, record) for record in records]
 
         timeout = httpx.Timeout(30.0, connect=10.0)
         with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
@@ -260,15 +362,19 @@ def execute(args: argparse.Namespace) -> object:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
-    PapersArgumentParser.json_requested = "--json" in arguments
-    as_json = parser.json_requested
+    PapersArgumentParser.jsonl_requested = "--jsonl" in arguments
+    as_jsonl = parser.jsonl_requested
     try:
         args = parser.parse_args(arguments)
-        as_json = bool(getattr(args, "json", False))
-        _render(execute(args), as_json)
+        as_jsonl = bool(args.jsonl)
+        records = execute(args)
+        if as_jsonl:
+            _render_jsonl(records)
+        else:
+            _render_human(args.command, records)
         return 0
     except PapersError as error:
-        if as_json:
+        if as_jsonl:
             print(json.dumps(_error(error), sort_keys=True, separators=(",", ":")))
         else:
             print(f"error [{error.code}]: {error}", file=sys.stderr)
