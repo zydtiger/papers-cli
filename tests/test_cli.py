@@ -11,9 +11,9 @@ import httpx
 import pytest
 
 from papers_cli import cli
-from papers_cli.db import Database
+from papers_cli.db import LIST_PAPER_FIELDS, Database
 from papers_cli.errors import PapersError
-from papers_cli.models import DownloadedFile, RemotePaper
+from papers_cli.models import REMOTE_PAPER_FIELDS, DownloadedFile, RemotePaper
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -132,6 +132,16 @@ def isolated_dirs(monkeypatch, tmp_path) -> tuple[Path, Path]:
     monkeypatch.setenv("PAPERS_CLI_DATA_DIR", str(data_dir))
     monkeypatch.setenv("PAPERS_CLI_CACHE_DIR", str(cache_dir))
     return data_dir, cache_dir
+
+
+def feed_with_entries(*source_keys: bytes) -> bytes:
+    fixture = (FIXTURES / "arxiv.xml").read_bytes()
+    prefix, _, rest = fixture.partition(b"<entry>")
+    entry, _, _ = rest.partition(b"</entry>")
+    entries = b"".join(
+        b"<entry>" + entry.replace(b"2301.00001", key) + b"</entry>" for key in source_keys
+    )
+    return prefix + entries + b"</feed>\n"
 
 
 def test_download_then_verify_has_stable_jsonl(monkeypatch, tmp_path, capsys) -> None:
@@ -872,3 +882,372 @@ def test_verify_help_documents_human_only_summary(capsys) -> None:
     flattened = " ".join(capsys.readouterr().out.split())
     assert "no machine summary record" in flattened
     assert "Verification summaries are reported in human mode only" in flattened
+
+
+FIELDS_COMMANDS = [
+    ["search", "--source", "arxiv", "--query", "fixture"],
+    ["lookup", "arxiv:2301.00001"],
+    ["list"],
+]
+
+FIELDS_EXCLUDED_COMMANDS = [
+    ["sources"],
+    ["download", "arxiv:2301.00001"],
+    ["path", "arxiv:2301.00001"],
+    ["remove", "arxiv:2301.00001"],
+    ["verify", "arxiv:2301.00001"],
+]
+
+
+def no_network_client(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.httpx,
+        "Client",
+        lambda **_: pytest.fail("field validation must fail before creating an HTTP client"),
+    )
+
+
+def test_search_fields_project_every_record_without_unselected_fields(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=feed_with_entries(b"2301.00001", b"2301.00002"))
+
+    mock_transport(monkeypatch, handler)
+    isolated_dirs(monkeypatch, tmp_path)
+
+    assert (
+        cli.main(
+            [
+                "search",
+                "--source",
+                "arxiv",
+                "--query",
+                "fixture",
+                "--fields",
+                "ref,title,authors",
+                "--jsonl",
+            ]
+        )
+        == 0
+    )
+    records = read_jsonl_records(capsys)
+    assert [str(record["ref"]) for record in records] == [
+        "arxiv:2301.00001",
+        "arxiv:2301.00002",
+    ]
+    for record in records:
+        assert set(record) == {"ref", "title", "authors"}
+        assert "abstract" not in record
+        assert "landing_url" not in record
+    assert records[0]["authors"] == ["Alice Example", "Bob Example"]
+
+    assert cli.main(["search", "--source", "arxiv", "--query", "fixture", "--jsonl"]) == 0
+    complete = read_jsonl_records(capsys)
+    assert len(complete) == len(records)
+    for projected, full in zip(records, complete, strict=True):
+        assert projected == {name: full[name] for name in ("ref", "title", "authors")}
+
+
+def test_search_fields_project_in_human_mode(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    mock_transport(monkeypatch, handler)
+    isolated_dirs(monkeypatch, tmp_path)
+
+    selection = ["--fields", "ref,title"]
+    assert cli.main(["search", "--source", "arxiv", "--query", "fixture", *selection]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert set(json.loads(captured.out)) == {"ref", "title"}
+
+
+def test_search_fields_with_empty_results_emits_no_records(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=feed_with_entries())
+
+    mock_transport(monkeypatch, handler)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert (
+        cli.main(
+            ["search", "--source", "arxiv", "--query", "fixture", "--fields", "ref", "--jsonl"]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert not data_dir.exists()
+
+
+def test_lookup_fields_project_remote_batch_in_input_order(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    mock_transport(monkeypatch, handler)
+    isolated_dirs(monkeypatch, tmp_path)
+
+    refs = ["arxiv:2301.00001", "arxiv:2301.00001"]
+    assert cli.main(["lookup", *refs, "--fields", "ref,doi", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert [str(record["ref"]) for record in records] == refs
+    for record in records:
+        assert set(record) == {"ref", "doi"}
+
+
+def test_lookup_fields_project_single_remote_reference(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    mock_transport(monkeypatch, handler)
+    isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["lookup", "arxiv:2301.00001", "--fields", "ref,title", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert len(records) == 1
+    assert set(records[0]) == {"ref", "title"}
+    assert str(records[0]["ref"]) == "arxiv:2301.00001"
+
+
+def test_lookup_fields_project_local_records_to_shared_fields(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    mock_transport(monkeypatch, handler)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    data_dir.mkdir()
+    database = Database(data_dir / "papers.sqlite3")
+    database.upsert_paper(local_paper("2301.00002"))
+    database.close()
+
+    refs = ["arxiv:2301.00002", "arxiv:2301.00001", "arxiv:2301.00002"]
+    assert cli.main(["lookup", *refs, "--fields", "ref,title", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert [str(record["ref"]) for record in records] == refs
+    for record in records:
+        assert set(record) == {"ref", "title"}
+
+    assert cli.main(["lookup", *refs, "--jsonl"]) == 0
+    complete = read_jsonl_records(capsys)
+    assert "id" in complete[0]
+    assert "created_at" in complete[0]
+    for projected, full in zip(records, complete, strict=True):
+        assert projected == {"ref": full["ref"], "title": full["title"]}
+
+
+def test_list_fields_return_intact_file_object_and_omit_absent(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    paper_id, _ = seed_downloaded_paper(data_dir, local_paper("2301.00001"))
+    database = Database(data_dir / "papers.sqlite3")
+    database.upsert_paper(local_paper("2301.00002"))
+    database.close()
+    reader = Database(data_dir / "papers.sqlite3", read_only=True)
+    expected_file = reader.get(paper_id)["file"]
+    reader.close()
+    assert isinstance(expected_file, dict)
+
+    assert cli.main(["list", "--fields", "ref,file", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert len(records) == 2
+    projected = {str(record["ref"]): record for record in records}
+    assert set(projected["arxiv:2301.00001"]) == {"ref", "file"}
+    assert projected["arxiv:2301.00001"]["file"] == expected_file
+    assert set(projected["arxiv:2301.00002"]) == {"ref"}
+
+
+def test_fields_defaults_preserve_complete_records(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "export.arxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+
+    mock_transport(monkeypatch, handler)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    seed_downloaded_paper(data_dir, local_paper("2301.00002"))
+
+    assert cli.main(["search", "--source", "arxiv", "--query", "fixture", "--jsonl"]) == 0
+    assert set(read_jsonl_records(capsys)[0]) == set(REMOTE_PAPER_FIELDS)
+
+    assert cli.main(["lookup", "arxiv:2301.00001", "--jsonl"]) == 0
+    assert set(read_jsonl_records(capsys)[0]) == set(REMOTE_PAPER_FIELDS)
+
+    assert cli.main(["lookup", "arxiv:2301.00002", "--jsonl"]) == 0
+    assert set(read_jsonl_records(capsys)[0]) == set(LIST_PAPER_FIELDS)
+
+    assert cli.main(["list", "--jsonl"]) == 0
+    assert set(read_jsonl_records(capsys)[0]) == set(LIST_PAPER_FIELDS)
+
+
+def test_fields_projection_matches_across_human_and_jsonl_modes(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    seed_downloaded_paper(data_dir, local_paper("2301.00001"))
+
+    assert cli.main(["list", "--fields", "ref,file", "--jsonl"]) == 0
+    machine = read_jsonl_records(capsys)
+
+    assert cli.main(["list", "--fields", "ref,file"]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert [json.loads(captured.out)] == machine
+
+
+def test_list_fields_with_empty_collection_emits_no_records(monkeypatch, tmp_path, capsys) -> None:
+    isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["list", "--fields", "ref", "--jsonl"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "selection", ["", "ref,", ",ref", "ref,,title", "ref,ref", "bogus", "ref,title,bogus"]
+)
+@pytest.mark.parametrize("argv", FIELDS_COMMANDS)
+def test_fields_reject_invalid_selections_before_access(
+    monkeypatch, tmp_path, capsys, argv, selection
+) -> None:
+    no_network_client(monkeypatch)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main([*argv, "--fields", selection, "--jsonl"]) == 2
+    assert read_error(capsys)["code"] == "usage"
+    assert not data_dir.exists()
+
+
+@pytest.mark.parametrize("selection", ["id", "created_at", "refreshed_at", "file"])
+@pytest.mark.parametrize("argv", FIELDS_COMMANDS[:2])
+def test_fields_reject_local_only_names_on_remote_commands(
+    monkeypatch, tmp_path, capsys, argv, selection
+) -> None:
+    no_network_client(monkeypatch)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main([*argv, "--fields", selection, "--jsonl"]) == 2
+    assert read_error(capsys)["code"] == "usage"
+    assert not data_dir.exists()
+
+
+def test_fields_invalid_selection_fails_usage_in_human_mode(capsys) -> None:
+    assert cli.main(["list", "--fields", "ref,ref"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "duplicate field name" in captured.err
+
+
+def test_fields_validation_precedes_source_resolution(monkeypatch, tmp_path, capsys) -> None:
+    no_network_client(monkeypatch)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert (
+        cli.main(["search", "--source", "unknown", "--query", "x", "--fields", "bogus", "--jsonl"])
+        == 2
+    )
+    assert read_error(capsys)["code"] == "usage"
+    assert not data_dir.exists()
+
+
+@pytest.mark.parametrize("argv", FIELDS_EXCLUDED_COMMANDS)
+def test_other_commands_reject_fields_flag(argv, capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([*argv, "--fields", "ref"])
+    assert excinfo.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", FIELDS_EXCLUDED_COMMANDS)
+def test_other_commands_reject_fields_flag_in_jsonl_mode(argv, capsys) -> None:
+    assert cli.main([*argv, "--fields", "ref", "--jsonl"]) == 2
+    assert read_error(capsys)["code"] == "usage"
+
+
+@pytest.mark.parametrize("command", ["search", "lookup", "list"])
+def test_metadata_help_documents_fields(command, capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([command, "--help"])
+    assert excinfo.value.code == 0
+    flattened = " ".join(capsys.readouterr().out.split())
+    assert "--fields" in flattened
+    assert "default: all fields" in flattened
+    assert "usage errors" in flattened
+    for field in cli.FIELD_VOCABULARIES[command]:
+        assert field in flattened
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["sources", "--help"],
+        ["download", "--help"],
+        ["path", "--help"],
+        ["remove", "--help"],
+        ["verify", "--help"],
+    ],
+)
+def test_other_command_help_omits_fields(argv, capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(argv)
+    assert excinfo.value.code == 0
+    flattened = " ".join(capsys.readouterr().out.split())
+    assert "--fields" not in flattened
+
+
+def test_list_ordering_and_limit_are_unchanged_with_fields(monkeypatch, tmp_path, capsys) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    data_dir.mkdir()
+    database = Database(data_dir / "papers.sqlite3")
+    rows = [
+        (
+            f"fixture-{number}",
+            "fixture",
+            str(number),
+            None,
+            "Fixture",
+            "",
+            "[]",
+            "[]",
+            None,
+            None,
+            None,
+            "https://example.test/landing",
+            "https://example.test/pdf",
+            f"2026-01-0{number}T00:00:00Z",
+            f"2026-01-0{number}T00:00:00Z",
+        )
+        for number in (1, 2, 3)
+    ]
+    with database.connection:
+        database.connection.executemany(
+            """INSERT INTO papers (
+            id, source, source_key, source_version, title, abstract, authors_json,
+            categories_json, published_at, updated_at, doi, landing_url, pdf_url,
+            created_at, refreshed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+    database.close()
+
+    assert cli.main(["list", "--jsonl"]) == 0
+    assert [str(record["ref"]) for record in read_jsonl_records(capsys)] == [
+        "fixture:3",
+        "fixture:2",
+        "fixture:1",
+    ]
+
+    assert cli.main(["list", "--limit", "2", "--fields", "ref", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert [str(record["ref"]) for record in records] == ["fixture:3", "fixture:2"]
+    assert all(set(record) == {"ref"} for record in records)
