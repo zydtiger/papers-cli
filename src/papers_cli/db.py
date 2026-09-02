@@ -6,10 +6,17 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final
 
 from .errors import PapersError
 from .ids import uuid7
-from .models import DownloadedFile, RemotePaper
+from .models import REMOTE_PAPER_FIELDS, DownloadedFile, RemotePaper
+
+# Top-level keys that Database._row_to_dict adds beyond the shared remote-paper
+# vocabulary; tests pin both constants to the serialized record keys.
+LOCAL_PAPER_FIELDS: Final[tuple[str, ...]] = ("id", "created_at", "refreshed_at", "file")
+
+LIST_PAPER_FIELDS: Final[tuple[str, ...]] = (*REMOTE_PAPER_FIELDS, *LOCAL_PAPER_FIELDS)
 
 
 def _now() -> str:

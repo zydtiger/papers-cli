@@ -24,13 +24,29 @@ Every command accepts `--jsonl` for JSON Lines output. Each logical result is on
 
 Without `--jsonl`, commands print human-readable output. Batch and whole-collection verification report a readable summary line in that mode.
 
+## Field selection
+
+The read-only metadata commands `search`, `lookup`, and `list` accept `--fields` with one comma-separated list of non-empty, unique top-level field names, such as `--fields ref,title,authors`. Each result record then contains only the selected fields, and the same projection applies in human and `--jsonl` mode. Record cardinality, ordering, values, and the versioned JSONL envelope are unchanged; this builds on the JSONL and batch-reference contracts from Issue #7.
+
+- `search` and `lookup` (local and remote) accept the normalized remote-paper vocabulary: `ref`, `source`, `source_key`, `source_version`, `title`, `abstract`, `authors`, `categories`, `published_at`, `updated_at`, `doi`, `landing_url`, `pdf_url`.
+- `list` additionally accepts the local-only fields `id`, `created_at`, `refreshed_at`, and `file`. `file` is one top-level field whose nested object (`sha256`, `byte_count`, `relative_path`, `source_url`) is returned intact when present and omitted when the paper has no attached PDF; use `papers path REF... --jsonl` for resolved absolute paths.
+
+An empty selection, an empty comma-separated segment, a duplicate name, or a name outside the command's vocabulary fails as a usage error (exit status 2) before any provider request or collection access. Omitting `--fields` preserves the complete record for every command.
+
+```sh
+uv run papers search --source arxiv --query "quantum computing" --fields ref,title,authors --jsonl
+uv run papers list --fields ref,title,file --jsonl
+```
+
+Field selection trims the serialized payload only; it does not reduce network, database, or in-memory work, and it does not replace `jq` for aggregation or transformations.
+
 ## Commands
 
 - `papers sources --jsonl` reports installed source capabilities, one record per source.
-- `papers search --source SOURCE --query QUERY --limit N --jsonl` searches official metadata. arXiv supports a general query; bioRxiv currently accepts a DOI only because its official API has no general full-text search endpoint.
-- `papers lookup REF... --jsonl` resolves each reference in input order, using a local UUID/alias or a recognized remote identifier, without changing local storage. Order and duplicate references are preserved, emitting one record per input.
+- `papers search --source SOURCE --query QUERY --limit N --jsonl` searches official metadata. arXiv supports a general query; bioRxiv currently accepts a DOI only because its official API has no general full-text search endpoint. Add `--fields` to return only selected top-level fields per result.
+- `papers lookup REF... --jsonl` resolves each reference in input order, using a local UUID/alias or a recognized remote identifier, without changing local storage. Order and duplicate references are preserved, emitting one record per input. `--fields` projects the shared remote-paper vocabulary onto local and remote records alike.
 - `papers download REF... --jsonl` obtains the official PDFs and persists metadata and provenance. Search results return reusable `ref` values.
-- `papers list --jsonl`, `papers path REF... --jsonl`, `papers verify REF... --jsonl` (mutually exclusive with `--all`), and `papers verify --all --jsonl` inspect the local collection. Reference batches preserve input order and duplicates and emit one record per reference.
+- `papers list --jsonl`, `papers path REF... --jsonl`, `papers verify REF... --jsonl` (mutually exclusive with `--all`), and `papers verify --all --jsonl` inspect the local collection. Reference batches preserve input order and duplicates and emit one record per reference. `list` also accepts `--fields`, including its local-only field names.
 - `papers remove REF --jsonl` removes one paper from the local collection. `REF` may be its UUID or a stored alias; the command never performs a provider lookup and intentionally accepts a single reference. Use `--dry-run` to inspect the planned removal without writing collection or cache state.
 
 There is no CLI approval flag: the invoking agent or person decides whether a download is allowed. `--dry-run` reports intended downloads without writing files or metadata.
