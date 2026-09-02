@@ -230,8 +230,7 @@ def build_parser() -> PapersArgumentParser:
         "remove",
         help="Remove a paper from the local collection",
         description=(
-            "Remove one paper from the local collection, emitting exactly one JSONL "
-            "record."
+            "Remove one paper from the local collection, emitting exactly one JSONL record."
         ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,

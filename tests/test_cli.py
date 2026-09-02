@@ -658,8 +658,7 @@ def test_tracked_files_contain_no_removed_flag_token() -> None:
     offenders = [
         name
         for name in tracked.stdout.splitlines()
-        if name
-        and removed_token.search((repo_root / name).read_bytes().decode("utf-8", "ignore"))
+        if name and removed_token.search((repo_root / name).read_bytes().decode("utf-8", "ignore"))
     ]
     assert offenders == []
 
@@ -761,9 +760,7 @@ def test_download_batch_preserves_order_for_distinct_references(
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "export.arxiv.org":
             requested = str(request.url.params.get("id_list", "2301.00001"))
-            return httpx.Response(
-                200, content=fixture.replace(b"2301.00001", requested.encode())
-            )
+            return httpx.Response(200, content=fixture.replace(b"2301.00001", requested.encode()))
         if request.url.host == "arxiv.org":
             return httpx.Response(
                 200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.7\nfixture"
@@ -783,9 +780,7 @@ def test_download_batch_preserves_order_for_distinct_references(
 def test_path_batch_preserves_order_and_duplicates(monkeypatch, tmp_path, capsys) -> None:
     data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
     first_id, first_path = seed_verified_paper(data_dir, "2301.00001")
-    second_id, second_path = seed_verified_paper(
-        data_dir, "2301.00002", body=b"%PDF-1.7\nsecond"
-    )
+    second_id, second_path = seed_verified_paper(data_dir, "2301.00002", body=b"%PDF-1.7\nsecond")
 
     assert cli.main(["path", first_id, second_id, first_id, "--jsonl"]) == 0
     envelopes = read_jsonl(capsys)
