@@ -5,19 +5,27 @@ description: Use the Papers CLI to discover official paper metadata, download ap
 
 Use `papers sources --jsonl` to discover available providers and capabilities before choosing a source.
 
-Use `papers search --source SOURCE --query QUERY --limit N --jsonl` to get normalized results. Preserve the returned `ref` when proposing or acquiring a result.
+Use `papers search --source SOURCE --query QUERY --limit N --fields ref,title,authors --jsonl` to get normalized results. Preserve the returned `ref` when proposing or acquiring a result.
 
 Use `--fields` with `search`, `lookup`, and `list` to request only the fields a workflow needs: `--fields ref,title,authors` fits discovery and approval reviews, and `papers list --fields ref,title,file --jsonl` builds a local collection manifest. Omit `--fields` when a step needs the complete record, such as reading an abstract for approval. Selections are existing top-level field names only, apply identically in human and `--jsonl` modes, and invalid selections fail as usage errors before any provider request or collection read. Keep jq for summaries and transformations that field selection cannot express.
 
+The shared fields for `search` and `lookup` are `ref`, `source`, `source_key`, `source_version`, `title`, `abstract`, `authors`, `categories`, `published_at`, `updated_at`, `doi`, `landing_url`, and `pdf_url`. Only `list` additionally accepts `id`, `created_at`, `refreshed_at`, and `file`; local `lookup` uses the shared vocabulary too. `file` returns the complete nested object when present and is omitted without an attached PDF. Use `path` for resolved absolute paths. Empty selections, empty comma-separated segments, duplicate names, and unknown names are usage errors.
+
 Treat downloading a PDF as an external side effect. Obtain the user's approval before running `papers download REF... --jsonl`; do not treat `--dry-run` as approval. Prefer one batched invocation for an approved set of references: reference-accepting commands preserve input order and duplicates and emit one record per reference.
 
-Use `papers lookup REF... --jsonl` before download when metadata or provenance needs confirmation. After acquisition, use `papers path REF... --jsonl` to retrieve local paths and `papers verify REF... --jsonl` to check stored digests. Use `papers verify --all --jsonl` for a collection audit.
+Use `papers lookup REF... --jsonl` before download when metadata or provenance needs confirmation. After acquisition, use `papers path REF... --jsonl` to retrieve local paths and `papers verify REF... --jsonl` to check stored digests. Use `papers verify --all --jsonl` for a collection audit; explicit references and `--all` are mutually exclusive.
 
-Machine-readable output is JSON Lines: one versioned JSON envelope per logical result on stdout, no output for an empty success, exactly one error object for a failed invocation, and nothing on stderr. `verify` emits only per-paper records with no machine summary; derive totals with jq when needed:
+Machine-readable output is JSON Lines: one versioned JSON envelope per logical result on stdout, no output for an empty success, exactly one error object for a handled command or usage failure, and no handled errors or summaries on stderr. `verify` emits only per-paper records with no machine summary; derive totals with jq when needed:
 
 ```sh
-papers verify --all --jsonl | jq -s '{total: length, verified: (map(select(.data.ok)) | length), failed: (map(select(.data.ok | not)) | length)}'
+set -o pipefail
+papers verify --all --jsonl | jq -s '
+  if any(.[]; .ok != true) then error("Verification command failed")
+  else {total: length, verified: (map(select(.data.ok)) | length), failed: (map(select(.data.ok | not)) | length)}
+  end'
 ```
+
+Check the pipeline exit status before using totals. Envelope `.ok` reports command success; `.data.ok` reports whether an individual PDF passed verification.
 
 Use `papers remove REF --dry-run --jsonl` to inspect a local removal before changing collection state. Removal accepts a local UUID or stored alias, never performs a provider lookup, and intentionally accepts a single reference. Obtain the user's approval before running `papers remove REF --jsonl`: it permanently removes the selected paper metadata and deletes its PDF only when the content-addressed object is not shared by another paper. There is no trash, undo, or restore command.
 

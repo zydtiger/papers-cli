@@ -80,11 +80,7 @@ Each imported paper has a UUIDv7 internal ID. Python 3.12 does not provide `uuid
 
 ## Development
 
-```sh
-uv run ruff check .
-uv run pyright
-uv run pytest
-```
+Use Python 3.12 or later with `uv`. Install the hook runner with `uv tool install prek`, then activate it with `prek install`. See `.pre-commit-config.yaml` for the authoritative validation commands and file scopes; CI uses the same hook configuration.
 
 Live-provider smoke checks are intentionally not part of the test suite.
 
