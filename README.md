@@ -6,22 +6,32 @@
 
 ```sh
 uv sync
-uv run papers sources --json
-uv run papers search --source arxiv --query "quantum computing" --limit 5 --json
-uv run papers download arxiv:2301.00001 --json
-uv run papers list --json
+uv run papers sources --jsonl
+uv run papers search --source arxiv --query "quantum computing" --limit 5 --jsonl
+uv run papers download arxiv:2301.00001 --jsonl
+uv run papers list --jsonl
 ```
 
-All `--json` commands emit exactly one versioned JSON document on stdout. A non-zero exit status is paired with an `error.code` where possible.
+## Machine-readable output
+
+Every command accepts `--jsonl` for JSON Lines output. Each logical result is one independently parseable JSON object on its own stdout line, wrapped in the versioned envelope `{"schema_version": 1, "ok": true, "data": ...}`.
+
+- Multi-result commands emit one line per logical result, in result order; single-result commands emit exactly one line.
+- A successful command with no results emits nothing and exits zero.
+- A usage or command-level failure emits exactly one `{"schema_version": 1, "ok": false, "error": ...}` object on stdout, keeps its documented non-zero exit status, and pairs it with an `error.code` where possible.
+- Machine summaries and handled command or usage errors are not written to stderr.
+- `papers verify REF... --jsonl` and `papers verify --all --jsonl` emit only per-paper verification records; there is no machine summary record. Totals are a human-mode concern, and agents can derive them with `jq -s` (see SKILL.md).
+
+Without `--jsonl`, commands print human-readable output. Batch and whole-collection verification report a readable summary line in that mode.
 
 ## Commands
 
-- `papers sources --json` reports installed source capabilities.
-- `papers search --source SOURCE --query QUERY --limit N --json` searches official metadata. arXiv supports a general query; bioRxiv currently accepts a DOI only because its official API has no general full-text search endpoint.
-- `papers lookup REF --json` resolves a local UUID/alias or looks up a recognized remote identifier without changing local storage.
-- `papers download REF... --json` obtains the official PDF and persists metadata and provenance. Search results return reusable `ref` values.
-- `papers list --json`, `papers path REF`, `papers verify REF --json`, and `papers verify --all --json` inspect the local collection.
-- `papers remove REF --json` removes one paper from the local collection. `REF` may be its UUID or a stored alias; the command never performs a provider lookup. Use `--dry-run` to inspect the planned removal without writing collection or cache state.
+- `papers sources --jsonl` reports installed source capabilities, one record per source.
+- `papers search --source SOURCE --query QUERY --limit N --jsonl` searches official metadata. arXiv supports a general query; bioRxiv currently accepts a DOI only because its official API has no general full-text search endpoint.
+- `papers lookup REF... --jsonl` resolves each reference in input order, using a local UUID/alias or a recognized remote identifier, without changing local storage. Order and duplicate references are preserved, emitting one record per input.
+- `papers download REF... --jsonl` obtains the official PDFs and persists metadata and provenance. Search results return reusable `ref` values.
+- `papers list --jsonl`, `papers path REF... --jsonl`, `papers verify REF... --jsonl` (mutually exclusive with `--all`), and `papers verify --all --jsonl` inspect the local collection. Reference batches preserve input order and duplicates and emit one record per reference.
+- `papers remove REF --jsonl` removes one paper from the local collection. `REF` may be its UUID or a stored alias; the command never performs a provider lookup and intentionally accepts a single reference. Use `--dry-run` to inspect the planned removal without writing collection or cache state.
 
 There is no CLI approval flag: the invoking agent or person decides whether a download is allowed. `--dry-run` reports intended downloads without writing files or metadata.
 
@@ -35,7 +45,7 @@ objects/sha256/ab/cd/<full-sha256>.pdf
 
 The downloader accepts only adapter-supplied HTTPS URLs, revalidates every redirect against an allowlist, limits downloads to 100 MiB, checks the PDF signature, calculates SHA-256 while streaming, `fsync`s, and atomically publishes the object. Existing digests are reused.
 
-Removal deletes the selected paper's metadata, aliases, and file links. A PDF object is deleted only when no other paper references its SHA-256 file record; shared objects are retained. If an expected object is already missing, Papers CLI still removes its stale metadata and reports `already_missing`. Removal is destructive and does not provide trash, undo, or restore behavior, so inspect `papers remove REF --dry-run --json` first when the target or object sharing is uncertain.
+Removal deletes the selected paper's metadata, aliases, and file links. A PDF object is deleted only when no other paper references its SHA-256 file record; shared objects are retained. If an expected object is already missing, Papers CLI still removes its stale metadata and reports `already_missing`. Removal is destructive and does not provide trash, undo, or restore behavior, so inspect `papers remove REF --dry-run --jsonl` first when the target or object sharing is uncertain.
 
 Incomplete downloads live in the disposable cache as `downloads/download-*.part`. After validation and `fsync`, Papers CLI atomically moves the part into the data directory's content-addressed object tree. This installation assumes the configured cache and data directories are on the same filesystem.
 
@@ -68,7 +78,7 @@ Install the `papers` executable globally with uv:
 
 ```sh
 uv tool install git+https://github.com/zydtiger/papers-cli.git
-papers sources --json
+papers sources --jsonl
 ```
 
 Then install the committed root skill globally in file mode:
