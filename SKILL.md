@@ -7,6 +7,8 @@ Use `papers sources --jsonl` to discover available providers and capabilities be
 
 Use `papers search --source SOURCE --query QUERY --limit N --jsonl` to get normalized results. Preserve the returned `ref` when proposing or acquiring a result.
 
+Use `--fields` with `search`, `lookup`, and `list` to request only the fields a workflow needs: `--fields ref,title,authors` fits discovery and approval reviews, and `papers list --fields ref,title,file --jsonl` builds a local collection manifest. Omit `--fields` when a step needs the complete record, such as reading an abstract for approval. Selections are existing top-level field names only, apply identically in human and `--jsonl` modes, and invalid selections fail as usage errors before any provider request or collection read. Keep jq for summaries and transformations that field selection cannot express.
+
 Treat downloading a PDF as an external side effect. Obtain the user's approval before running `papers download REF... --jsonl`; do not treat `--dry-run` as approval. Prefer one batched invocation for an approved set of references: reference-accepting commands preserve input order and duplicates and emit one record per reference.
 
 Use `papers lookup REF... --jsonl` before download when metadata or provenance needs confirmation. After acquisition, use `papers path REF... --jsonl` to retrieve local paths and `papers verify REF... --jsonl` to check stored digests. Use `papers verify --all --jsonl` for a collection audit.

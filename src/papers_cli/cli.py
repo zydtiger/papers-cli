@@ -5,21 +5,28 @@ import json
 import sqlite3
 import sys
 from collections.abc import Sequence
-from typing import NoReturn
+from typing import Final, NoReturn
 
 import httpx
 
 from .config import ensure_paths, get_paths
-from .db import Database
+from .db import LIST_PAPER_FIELDS, Database
 from .downloader import download_pdf
 from .errors import PapersError
-from .models import RemotePaper
+from .models import REMOTE_PAPER_FIELDS, RemotePaper
 from .sources import adapter_for, infer_adapter, source_capabilities
 from .storage import local_path, remove_local, verify_file
 
 SCHEMA_VERSION = 1
 
 JSONL_HELP = "emit one versioned JSONL record per logical result"
+
+# Commands that accept --fields and the top-level field vocabulary each may project.
+FIELD_VOCABULARIES: Final[dict[str, tuple[str, ...]]] = {
+    "search": REMOTE_PAPER_FIELDS,
+    "lookup": REMOTE_PAPER_FIELDS,
+    "list": LIST_PAPER_FIELDS,
+}
 
 USAGE_EPILOG = (
     "Machine-readable output: --jsonl emits one versioned JSON object per logical "
@@ -136,6 +143,46 @@ def _lookup_record(ref: str, database: Database | None, client: httpx.Client) ->
     return adapter.lookup(raw, client).as_dict()
 
 
+def _fields_help(command: str) -> str:
+    return (
+        "return only these comma-separated top-level fields per record "
+        "(default: all fields); empty segments, duplicate names, and unknown names "
+        f"are usage errors; allowed fields: {', '.join(FIELD_VOCABULARIES[command])}"
+    )
+
+
+def _selected_fields(args: argparse.Namespace) -> tuple[str, ...] | None:
+    value = getattr(args, "fields", None)
+    if value is None:
+        return None
+    allowed = FIELD_VOCABULARIES[args.command]
+    selected = value.split(",")
+    if "" in selected:
+        raise PapersError("usage", "--fields must not contain empty field names", exit_code=2)
+    seen: set[str] = set()
+    for name in selected:
+        if name in seen:
+            raise PapersError(
+                "usage", f"--fields contains duplicate field name '{name}'", exit_code=2
+            )
+        seen.add(name)
+    unknown = [name for name in selected if name not in allowed]
+    if unknown:
+        raise PapersError(
+            "usage",
+            f"--fields has unknown field name(s) for {args.command}: "
+            f"{', '.join(unknown)}; allowed: {', '.join(allowed)}",
+            exit_code=2,
+        )
+    return tuple(selected)
+
+
+def _project(record: object, fields: tuple[str, ...]) -> object:
+    if not isinstance(record, dict):
+        raise PapersError("storage_corrupt", "Field selection requires object records", exit_code=5)
+    return {name: record[name] for name in fields if name in record}
+
+
 class PapersArgumentParser(argparse.ArgumentParser):
     jsonl_requested = False
 
@@ -174,6 +221,7 @@ def build_parser() -> PapersArgumentParser:
     search.add_argument("--query", required=True)
     search.add_argument("--limit", type=int, default=10)
     search.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
+    search.add_argument("--fields", help=_fields_help("search"))
 
     lookup = commands.add_parser(
         "lookup",
@@ -187,6 +235,7 @@ def build_parser() -> PapersArgumentParser:
     )
     lookup.add_argument("refs", nargs="+")
     lookup.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
+    lookup.add_argument("--fields", help=_fields_help("lookup"))
 
     download = commands.add_parser(
         "download",
@@ -212,6 +261,7 @@ def build_parser() -> PapersArgumentParser:
     listing.add_argument("--source")
     listing.add_argument("--limit", type=int, default=100)
     listing.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
+    listing.add_argument("--fields", help=_fields_help("list"))
 
     path = commands.add_parser(
         "path",
@@ -367,7 +417,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(arguments)
         as_jsonl = bool(args.jsonl)
+        fields = _selected_fields(args)
         records = execute(args)
+        if fields is not None:
+            records = [_project(record, fields) for record in records]
         if as_jsonl:
             _render_jsonl(records)
         else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from typing import Final
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,24 @@ class RemotePaper:
         result = asdict(self)
         result["ref"] = self.ref
         return result
+
+
+# Top-level keys of RemotePaper.as_dict(); tests pin this to the dataclass and ref.
+REMOTE_PAPER_FIELDS: Final[tuple[str, ...]] = (
+    "ref",
+    "source",
+    "source_key",
+    "source_version",
+    "title",
+    "abstract",
+    "authors",
+    "categories",
+    "published_at",
+    "updated_at",
+    "doi",
+    "landing_url",
+    "pdf_url",
+)
 
 
 @dataclass(frozen=True, slots=True)

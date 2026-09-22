@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 
-from papers_cli.db import Database
-from papers_cli.models import DownloadedFile, RemotePaper
+from papers_cli.db import LIST_PAPER_FIELDS, LOCAL_PAPER_FIELDS, Database
+from papers_cli.models import REMOTE_PAPER_FIELDS, DownloadedFile, RemotePaper
 
 
 class RaceInjectingConnection:
@@ -158,3 +159,23 @@ def test_read_only_database_observes_committed_active_wal(tmp_path) -> None:
     assert reader.get(paper_id)["ref"] == "arxiv:2301.00001"
     reader.close()
     writer.close()
+
+
+def test_remote_paper_fields_match_serialized_record_keys() -> None:
+    assert set(REMOTE_PAPER_FIELDS) == set(sample_paper().as_dict())
+
+
+def test_list_paper_fields_match_local_record_keys(tmp_path) -> None:
+    database = Database(tmp_path / "papers.sqlite3")
+    paper_id = database.upsert_paper(sample_paper())
+    file = DownloadedFile(
+        "a" * 64, 12, "objects/sha256/aa/aa/" + "a" * 64 + ".pdf", "https://arxiv.org/pdf/x"
+    )
+    database.attach_file(paper_id, file, "2")
+    fileless_id = database.upsert_paper(replace(sample_paper(), source_key="2301.00002"))
+
+    assert set(database.get(paper_id)) == set(LIST_PAPER_FIELDS)
+    assert set(database.get(fileless_id)) == set(LIST_PAPER_FIELDS) - {"file"}
+    assert set(LOCAL_PAPER_FIELDS) == {"id", "created_at", "refreshed_at", "file"}
+    assert set(LIST_PAPER_FIELDS) == set(REMOTE_PAPER_FIELDS) | set(LOCAL_PAPER_FIELDS)
+    database.close()
