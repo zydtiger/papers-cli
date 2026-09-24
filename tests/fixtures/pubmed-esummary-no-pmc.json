@@ -1,0 +1,16 @@
+{
+  "header": {"type": "esummary", "version": "0.3"},
+  "result": {
+    "uids": ["99999999"],
+    "99999999": {
+      "uid": "99999999",
+      "pubdate": "2020 Jun",
+      "title": "Metadata-only PubMed fixture",
+      "authors": [{"name": "Example A"}],
+      "articleids": [
+        {"idtype": "pubmed", "value": "99999999"},
+        {"idtype": "doi", "value": "10.1145/3377811.3380366"}
+      ]
+    }
+  }
+}

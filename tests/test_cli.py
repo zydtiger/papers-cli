@@ -493,6 +493,70 @@ def test_crossref_download_persists_pmc_file_provenance(monkeypatch, tmp_path, c
     assert str(files[0]["source_url"]).endswith("/PMC3531190.1/PMC3531190.1.txt")
 
 
+def test_pubmed_search_uses_batched_metadata_and_emits_reusable_refs(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/esearch.fcgi"):
+            assert request.url.params["term"] == "GenBank"
+            assert request.url.params["retmax"] == "2"
+            return httpx.Response(200, content=(FIXTURES / "pubmed-esearch.json").read_bytes())
+        assert request.url.path.endswith("/esummary.fcgi")
+        assert request.url.params["id"] == "23193287,31567725"
+        return httpx.Response(200, content=(FIXTURES / "pubmed-esummary.json").read_bytes())
+
+    mock_transport(monkeypatch, handler)
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+
+    assert (
+        cli.main(["search", "--source", "pubmed", "--query", "GenBank", "--limit", "2", "--jsonl"])
+        == 0
+    )
+    records = read_jsonl_records(capsys)
+    assert [record["ref"] for record in records] == ["pubmed:23193287", "pubmed:31567725"]
+    assert all(record["fulltext_availability"] == "unknown" for record in records)
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
+def test_pubmed_download_persists_pmc_file_provenance(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/esummary.fcgi"):
+            return httpx.Response(200, content=(FIXTURES / "pubmed-esummary.json").read_bytes())
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            return httpx.Response(
+                200, content=(FIXTURES / "pmc-idconv-pmid-current.json").read_bytes()
+            )
+        if request.url.path == "/metadata/PMC3531190.1.json":
+            return httpx.Response(
+                200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+            )
+        assert request.url.path.endswith(".pdf")
+        return httpx.Response(
+            200, headers={"content-type": "binary/octet-stream"}, content=pdf_bytes()
+        )
+
+    mock_transport(monkeypatch, handler)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "pmid:23193287", "--jsonl"]) == 0
+    downloaded = read_jsonl_records(capsys)[0]
+    assert downloaded["ref"] == "pubmed:23193287"
+    assert downloaded["source"] == "pubmed"
+
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    record = database.get("pubmed:23193287")
+    database.close()
+    files = record["files"]
+    assert isinstance(files, list)
+    assert len(files) == 1
+    file = files[0]
+    assert isinstance(file, dict)
+    assert file["source"] == "pmc"
+    assert file["source_version"] == "1"
+    assert str(file["source_url"]).endswith("/PMC3531190.1/PMC3531190.1.pdf")
+
+
 def test_download_format_is_strict_and_never_falls_back_to_pdf(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -560,6 +624,39 @@ def test_lookup_resolves_stored_doi_alias_without_remote_doi_request(
     assert cli.main(["lookup", "doi:10.1000/test", "--jsonl"]) == 0
     records = read_jsonl_records(capsys)
     assert [record["ref"] for record in records] == ["arxiv:2301.00001"]
+
+
+def test_local_pmid_reference_prefers_stored_pubmed_record_without_network(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    data_dir.mkdir()
+    database = Database(data_dir / "papers.sqlite3")
+    database.upsert_paper(
+        replace(
+            local_paper("PMC3531190"),
+            source="pmc",
+            source_version="1",
+            pmid="23193287",
+        )
+    )
+    database.upsert_paper(
+        replace(
+            local_paper("23193287"),
+            source="pubmed",
+            source_version=None,
+            pmid="23193287",
+            landing_url="https://pubmed.ncbi.nlm.nih.gov/23193287/",
+        )
+    )
+    database.close()
+    mock_transport(
+        monkeypatch, lambda _: pytest.fail("stored PubMed references must not request a provider")
+    )
+
+    assert cli.main(["lookup", "pubmed:23193287", "pmid:23193287", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert [record["ref"] for record in records] == ["pubmed:23193287", "pubmed:23193287"]
 
 
 def test_unresolved_doi_uses_crossref_without_creating_collection_state(
@@ -1062,7 +1159,7 @@ def test_sources_emits_one_record_per_capability(capsys) -> None:
     records = read_jsonl_records(capsys)
     assert len(records) >= 2
     by_name = {str(record["name"]): record for record in records}
-    assert {"arxiv", "biorxiv"} <= set(by_name)
+    assert {"arxiv", "biorxiv", "pubmed"} <= set(by_name)
     assert by_name["arxiv"]["metadata_search"] is True
     assert by_name["arxiv"]["reference_formats"] == ["arxiv_id"]
     assert by_name["arxiv"]["fulltext_formats"] == ["pdf"]
@@ -1070,6 +1167,9 @@ def test_sources_emits_one_record_per_capability(capsys) -> None:
     assert by_name["biorxiv"]["metadata_search"] is False
     assert by_name["biorxiv"]["reference_formats"] == ["doi"]
     assert by_name["biorxiv"]["fulltext_formats"] == ["pdf"]
+    assert by_name["pubmed"]["metadata_search"] is True
+    assert by_name["pubmed"]["reference_formats"] == ["pmid"]
+    assert by_name["pubmed"]["delivery_source"] == "pmc"
 
 
 def test_list_emits_one_record_per_paper(monkeypatch, tmp_path, capsys) -> None:
@@ -1347,13 +1447,22 @@ def test_subcommand_help_documents_jsonl_contract(argv, cardinality, capsys) -> 
 
 
 @pytest.mark.parametrize("command", ["lookup", "download"])
-def test_reference_help_documents_remote_doi_resolution(command, capsys) -> None:
+def test_reference_help_documents_doi_and_pmid_resolution(command, capsys) -> None:
     with pytest.raises(SystemExit) as excinfo:
         cli.main([command, "--help"])
     assert excinfo.value.code == 0
     flattened = " ".join(capsys.readouterr().out.split())
     assert "crossref:DOI" in flattened
+    assert "pubmed:PMID" in flattened
     assert "DOI references use Crossref metadata" in flattened
+    assert "pmid:PMID uses PubMed metadata" in flattened
+
+
+def test_search_help_documents_pubmed_metadata_search(capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["search", "--help"])
+    assert excinfo.value.code == 0
+    assert "PubMed supports keyword metadata search" in " ".join(capsys.readouterr().out.split())
 
 
 def test_verify_help_documents_human_only_summary(capsys) -> None:

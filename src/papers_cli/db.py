@@ -571,6 +571,19 @@ class Database:
                             details={"ref": f"doi:{normalized_value}", "refs": refs},
                         ) from None
                     row = rows[0] if rows else None
+                elif normalized_scheme == "pmid":
+                    row = self.connection.execute(
+                        self._select() + " WHERE p.source = 'pubmed' AND "
+                        "(p.source_key = ? OR p.pmid = ?)",
+                        (normalized_value, normalized_value),
+                    ).fetchone()
+                    if row is None:
+                        row = self.connection.execute(
+                            self._select()
+                            + " JOIN aliases a ON a.paper_id = p.id"
+                            + " WHERE a.scheme = ? AND a.normalized_value = ?",
+                            (normalized_scheme, normalized_value),
+                        ).fetchone()
                 else:
                     row = self.connection.execute(
                         self._select()
