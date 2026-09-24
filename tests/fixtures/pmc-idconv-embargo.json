@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "records": [
+    {
+      "pmcid": "PMC9999999",
+      "pmid": "99999999",
+      "doi": "10.1000/embargo",
+      "requested-id": "PMC9999999",
+      "versions": [
+        {
+          "pmcid": "PMC9999999.1",
+          "current": true,
+          "live": false,
+          "release-date": "2027-01-01"
+        }
+      ]
+    }
+  ]
+}

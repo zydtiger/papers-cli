@@ -1,0 +1,15 @@
+{
+  "pmcid": "PMC3531190",
+  "version": 1,
+  "pmid": 23193287,
+  "doi": "10.1093/nar/gks1195",
+  "title": "GenBank",
+  "citation": "Nucleic Acids Research",
+  "license_code": "CC BY-NC",
+  "is_pmc_openaccess": true,
+  "is_manuscript": false,
+  "is_retracted": false,
+  "pdf_url": "s3://pmc-oa-opendata/PMC3531190.1/PMC3531190.1.pdf?md5=0123456789abcdef0123456789abcdef",
+  "text_url": "s3://pmc-oa-opendata/PMC3531190.1/PMC3531190.1.txt?md5=0123456789abcdef0123456789abcdef",
+  "xml_url": "s3://pmc-oa-opendata/PMC3531190.1/PMC3531190.1.xml?md5=0123456789abcdef0123456789abcdef"
+}

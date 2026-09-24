@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Iterable
 from typing import Protocol
+from urllib.parse import urlparse
 from xml.etree.ElementTree import Element
 
 import httpx
@@ -13,6 +15,11 @@ from .models import DownloadTarget, RemotePaper, content_media_type
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv"
+PMC_ID_CONVERTER_API = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
+PMC_ESUMMARY_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+PMC_CLOUD_HOST = "pmc-oa-opendata.s3.amazonaws.com"
+PMC_CLOUD_API = f"https://{PMC_CLOUD_HOST}"
+PMC_ARTICLE_URL = "https://pmc.ncbi.nlm.nih.gov/articles"
 ARXIV_ID = re.compile(
     r"^(?P<id>\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v(?P<version>\d+))?$", re.I
 )
@@ -22,6 +29,7 @@ ARXIV_ID = re.compile(
 # accepts the narrower 10.1101 prefix.
 GENERIC_DOI = re.compile(r"^10\.\d{4,9}/\S+$", re.I)
 BIORXIV_DOI = re.compile(r"^10\.1101/[A-Za-z0-9._;()/:+-]+$", re.I)
+PMCID = re.compile(r"^(?P<id>PMC\d+)(?:\.(?P<version>\d+))?$", re.I)
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
 
@@ -67,6 +75,11 @@ def _download_target(
         available_formats = sorted(
             set(paper.content_urls) | ({"pdf"} if paper.pdf_url is not None else set())
         )
+        availability = (
+            "known"
+            if available_formats or paper.fulltext_availability == "unavailable"
+            else "unknown"
+        )
         raise PapersError(
             "format_unavailable",
             f"{paper.source} does not provide {format} full text for {paper.ref}",
@@ -75,7 +88,7 @@ def _download_target(
                 "ref": paper.ref,
                 "requested_format": format,
                 "available_formats": available_formats,
-                "availability": "known",
+                "availability": availability,
             },
         )
     return DownloadTarget(format, url, allowed_hosts, content_media_type(format), paper.source)
@@ -287,7 +300,356 @@ class BiorxivAdapter:
         )
 
 
-ADAPTERS: dict[str, SourceAdapter] = {"arxiv": ArxivAdapter(), "biorxiv": BiorxivAdapter()}
+class PmcAdapter:
+    source = "pmc"
+    allowed_hosts = frozenset({PMC_CLOUD_HOST})
+
+    def __init__(self) -> None:
+        self._last_request_at: float | None = None
+
+    def _parse_ref(self, raw: str) -> tuple[str, str | None]:
+        candidate = _without_source_prefix(raw, self.source)
+        match = PMCID.fullmatch(candidate)
+        if not match:
+            raise PapersError(
+                "invalid_ref",
+                "Expected a PMC identifier such as PMC3531190 or PMC3531190.1",
+                exit_code=2,
+            )
+        return match.group("id").upper(), match.group("version")
+
+    def normalize_ref(self, raw: str) -> str:
+        return self._parse_ref(raw)[0]
+
+    def _wait_for_request_slot(self) -> None:
+        if self._last_request_at is not None:
+            remaining = 1 / 3 - (time.monotonic() - self._last_request_at)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last_request_at = time.monotonic()
+
+    def _request(
+        self,
+        client: httpx.Client,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        source: str,
+    ) -> httpx.Response:
+        for attempt in range(3):
+            self._wait_for_request_slot()
+            try:
+                response = client.get(url, params=params)
+            except httpx.HTTPError as exc:
+                if attempt < 2:
+                    time.sleep(0.25 * (2**attempt))
+                    continue
+                raise PapersError(
+                    "source_network", f"{source} metadata request failed: {exc}", exit_code=4
+                ) from exc
+            if response.status_code in {429, 502, 503, 504} and attempt < 2:
+                time.sleep(0.25 * (2**attempt))
+                continue
+            if response.status_code in {401, 403}:
+                raise PapersError(
+                    "source_access",
+                    f"{source} metadata access was restricted with HTTP {response.status_code}",
+                    exit_code=4,
+                )
+            return response
+        raise AssertionError("unreachable")
+
+    def _json(
+        self,
+        client: httpx.Client,
+        url: str,
+        *,
+        params: dict[str, str] | None = None,
+        source: str,
+    ) -> dict[str, object]:
+        response = self._request(client, url, params=params, source=source)
+        if response.status_code == 404:
+            raise PapersError("not_found", f"No {source} record was found", exit_code=3)
+        if response.status_code >= 400:
+            raise PapersError(
+                "source_network",
+                f"{source} metadata request failed with HTTP {response.status_code}",
+                exit_code=4,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PapersError(
+                "source_protocol", f"{source} returned invalid JSON", exit_code=4
+            ) from exc
+        if not isinstance(payload, dict):
+            raise PapersError(
+                "source_protocol", f"{source} returned an unexpected JSON payload", exit_code=4
+            )
+        return payload
+
+    def _converter_record(self, pmcid: str, client: httpx.Client) -> dict[str, object]:
+        payload = self._json(
+            client,
+            PMC_ID_CONVERTER_API,
+            params={
+                "ids": pmcid,
+                "format": "json",
+                "versions": "yes",
+                "showaiid": "yes",
+                "tool": "papers_cli",
+            },
+            source="PMC ID Converter",
+        )
+        records = payload.get("records")
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            raise PapersError(
+                "source_protocol", "PMC ID Converter returned an invalid record", exit_code=4
+            )
+        record = records[0]
+        if record.get("status") == "error":
+            raise PapersError("not_found", "No PMC record was found", exit_code=3)
+        returned = record.get("pmcid")
+        if not isinstance(returned, str) or returned.upper().split(".", 1)[0] != pmcid:
+            raise PapersError(
+                "source_protocol", "PMC ID Converter returned a mismatched PMCID", exit_code=4
+            )
+        return record
+
+    def _version_from_record(
+        self, record: dict[str, object], pmcid: str, requested_version: str | None
+    ) -> tuple[str, bool | None]:
+        versions = record.get("versions")
+        if not isinstance(versions, list):
+            raise PapersError(
+                "source_protocol", "PMC ID Converter returned no version information", exit_code=4
+            )
+        expected = f"{pmcid}.{requested_version}" if requested_version is not None else None
+        selected: dict[str, object] | None = None
+        for item in versions:
+            if not isinstance(item, dict):
+                raise PapersError(
+                    "source_protocol", "PMC ID Converter returned an invalid version", exit_code=4
+                )
+            versioned = item.get("pmcid")
+            if not isinstance(versioned, str):
+                continue
+            if expected is not None and versioned.upper() == expected:
+                selected = item
+                break
+            if expected is None and item.get("current") is True:
+                selected = item
+                break
+        if selected is None:
+            raise PapersError("not_found", "No requested PMC version was found", exit_code=3)
+        versioned = selected.get("pmcid")
+        if not isinstance(versioned, str) or not PMCID.fullmatch(versioned):
+            raise PapersError(
+                "source_protocol",
+                "PMC ID Converter returned an invalid versioned PMCID",
+                exit_code=4,
+            )
+        match = PMCID.fullmatch(versioned)
+        assert match is not None
+        if match.group("id").upper() != pmcid or match.group("version") is None:
+            raise PapersError(
+                "source_protocol",
+                "PMC ID Converter returned an invalid versioned PMCID",
+                exit_code=4,
+            )
+        live = selected.get("live")
+        return versioned.upper(), live if isinstance(live, bool) else None
+
+    @staticmethod
+    def _optional_identifier(record: dict[str, object], name: str) -> str | None:
+        value = record.get(name)
+        if value is None:
+            return None
+        if isinstance(value, int) or isinstance(value, str):
+            normalized = str(value).strip()
+            return normalized or None
+        raise PapersError("source_protocol", f"PMC metadata has an invalid {name}", exit_code=4)
+
+    @staticmethod
+    def _cloud_content_url(value: object, versioned_pmcid: str, format: str) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise PapersError(
+                "source_protocol", "PMC metadata has an invalid full-text URL", exit_code=4
+            )
+        parsed = urlparse(value)
+        expected_path = f"/{versioned_pmcid}/{versioned_pmcid}.{format}"
+        if (
+            parsed.scheme != "s3"
+            or parsed.netloc != "pmc-oa-opendata"
+            or parsed.path != expected_path
+        ):
+            raise PapersError(
+                "source_protocol", "PMC metadata has an unexpected full-text URL", exit_code=4
+            )
+        return f"{PMC_CLOUD_API}{parsed.path}"
+
+    def _paper_from_metadata(
+        self,
+        metadata: dict[str, object],
+        record: dict[str, object],
+        pmcid: str,
+        versioned_pmcid: str,
+    ) -> RemotePaper:
+        returned_pmcid = self._optional_identifier(metadata, "pmcid")
+        version = self._optional_identifier(metadata, "version")
+        expected_version = versioned_pmcid.rsplit(".", 1)[1]
+        if returned_pmcid != pmcid or version != expected_version:
+            raise PapersError(
+                "source_protocol",
+                "PMC Cloud metadata does not match the requested version",
+                exit_code=4,
+            )
+        content_urls: dict[str, str] = {}
+        metadata_fields = {"pdf": "pdf_url", "txt": "text_url", "xml": "xml_url"}
+        for format, field in metadata_fields.items():
+            url = self._cloud_content_url(metadata.get(field), versioned_pmcid, format)
+            if url is not None:
+                content_urls[format] = url
+        if content_urls:
+            availability = "available"
+        elif all(field in metadata for field in metadata_fields.values()):
+            availability = "unavailable"
+        else:
+            availability = "unknown"
+        title = metadata.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise PapersError("source_protocol", "PMC metadata has an invalid title", exit_code=4)
+        license_code = metadata.get("license_code")
+        if license_code is not None and (
+            not isinstance(license_code, str) or not license_code.strip()
+        ):
+            raise PapersError(
+                "source_protocol", "PMC metadata has an invalid license code", exit_code=4
+            )
+        return RemotePaper(
+            source=self.source,
+            source_key=pmcid,
+            source_version=expected_version,
+            title=" ".join(title.split()),
+            abstract="",
+            authors=[],
+            categories=[],
+            published_at=None,
+            updated_at=None,
+            doi=(
+                self._optional_identifier(metadata, "doi")
+                or self._optional_identifier(record, "doi")
+            ),
+            landing_url=f"{PMC_ARTICLE_URL}/{pmcid}/",
+            pdf_url=content_urls.get("pdf"),
+            content_urls=content_urls,
+            pmcid=pmcid,
+            pmid=self._optional_identifier(metadata, "pmid")
+            or self._optional_identifier(record, "pmid"),
+            license_code=license_code,
+            fulltext_availability=availability,
+        )
+
+    def _unavailable_paper(
+        self,
+        record: dict[str, object],
+        pmcid: str,
+        versioned_pmcid: str,
+        client: httpx.Client,
+        availability: str,
+    ) -> RemotePaper:
+        summary = self._json(
+            client,
+            PMC_ESUMMARY_API,
+            params={
+                "db": "pmc",
+                "id": pmcid.removeprefix("PMC"),
+                "retmode": "json",
+                "tool": "papers_cli",
+            },
+            source="PMC ESummary",
+        )
+        result = summary.get("result")
+        if not isinstance(result, dict):
+            raise PapersError(
+                "source_protocol", "PMC ESummary returned an invalid record", exit_code=4
+            )
+        uids = result.get("uids")
+        if not isinstance(uids, list) or len(uids) != 1 or not isinstance(uids[0], str):
+            raise PapersError("not_found", "No PMC summary record was found", exit_code=3)
+        item = result.get(uids[0])
+        if not isinstance(item, dict):
+            raise PapersError(
+                "source_protocol", "PMC ESummary returned an invalid record", exit_code=4
+            )
+        title = item.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise PapersError("source_protocol", "PMC ESummary returned no title", exit_code=4)
+        authors_value = item.get("authors")
+        authors = []
+        if isinstance(authors_value, list):
+            for author in authors_value:
+                if isinstance(author, dict) and isinstance(author.get("name"), str):
+                    authors.append(author["name"])
+                elif not isinstance(author, dict):
+                    raise PapersError(
+                        "source_protocol", "PMC ESummary returned invalid authors", exit_code=4
+                    )
+        published_at = item.get("pubdate")
+        if published_at is not None and not isinstance(published_at, str):
+            raise PapersError(
+                "source_protocol", "PMC ESummary returned an invalid publication date", exit_code=4
+            )
+        return RemotePaper(
+            source=self.source,
+            source_key=pmcid,
+            source_version=versioned_pmcid.rsplit(".", 1)[1],
+            title=" ".join(title.split()),
+            abstract="",
+            authors=authors,
+            categories=[],
+            published_at=published_at,
+            updated_at=None,
+            doi=self._optional_identifier(record, "doi"),
+            landing_url=f"{PMC_ARTICLE_URL}/{pmcid}/",
+            pdf_url=None,
+            pmcid=pmcid,
+            pmid=self._optional_identifier(record, "pmid"),
+            fulltext_availability=availability,
+        )
+
+    def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget:
+        return _download_target(paper, format, self.allowed_hosts)
+
+    def lookup(self, raw: str, client: httpx.Client) -> RemotePaper:
+        pmcid, requested_version = self._parse_ref(raw)
+        record = self._converter_record(pmcid, client)
+        versioned_pmcid, live = self._version_from_record(record, pmcid, requested_version)
+        if live is False:
+            return self._unavailable_paper(record, pmcid, versioned_pmcid, client, "unavailable")
+        try:
+            metadata = self._json(
+                client,
+                f"{PMC_CLOUD_API}/metadata/{versioned_pmcid}.json",
+                source="PMC Cloud",
+            )
+        except PapersError as error:
+            if error.code != "not_found":
+                raise
+            return self._unavailable_paper(record, pmcid, versioned_pmcid, client, "unknown")
+        return self._paper_from_metadata(metadata, record, pmcid, versioned_pmcid)
+
+    def search(self, query: str, limit: int, client: httpx.Client) -> list[RemotePaper]:
+        raise PapersError("unsupported_search", "PMC keyword search is not installed", exit_code=2)
+
+
+ADAPTERS: dict[str, SourceAdapter] = {
+    "arxiv": ArxivAdapter(),
+    "biorxiv": BiorxivAdapter(),
+    "pmc": PmcAdapter(),
+}
 
 
 def adapter_for(source: str) -> SourceAdapter:
@@ -303,6 +665,8 @@ def infer_adapter(ref: str) -> tuple[SourceAdapter, str]:
         return ADAPTERS["arxiv"], ref
     if BIORXIV_DOI.fullmatch(candidate):
         return ADAPTERS["biorxiv"], ref
+    if PMCID.fullmatch(candidate):
+        return ADAPTERS["pmc"], ref
     if GENERIC_DOI.fullmatch(candidate):
         raise _remote_doi_unsupported()
     if ":" in ref:
@@ -313,7 +677,8 @@ def infer_adapter(ref: str) -> tuple[SourceAdapter, str]:
         return adapter, raw
     raise PapersError(
         "invalid_ref",
-        "Use a UUID, arxiv:IDENTIFIER, or biorxiv:10.1101/DOI; doi:DOI is local-only",
+        "Use a UUID, arxiv:IDENTIFIER, biorxiv:10.1101/DOI, or pmc:PMCIDENTIFIER; "
+        "doi:DOI is local-only",
         exit_code=2,
     )
 
@@ -339,5 +704,15 @@ def source_capabilities() -> Iterable[dict[str, object]]:
             "fulltext_formats": ["pdf"],
             "download": True,
             "official_api": BIORXIV_API,
+        },
+        {
+            "name": "pmc",
+            "search": False,
+            "metadata_search": False,
+            "lookup": True,
+            "reference_formats": ["pmcid"],
+            "fulltext_formats": ["pdf", "txt", "xml"],
+            "download": True,
+            "official_api": PMC_ID_CONVERTER_API,
         },
     )

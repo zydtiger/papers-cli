@@ -1,0 +1,14 @@
+{
+  "status": "ok",
+  "records": [
+    {
+      "pmcid": "PMC3531190",
+      "pmid": "23193287",
+      "doi": "10.1093/nar/gks1195",
+      "requested-id": "PMC3531190",
+      "versions": [
+        {"pmcid": "PMC3531190.1", "current": true, "live": true}
+      ]
+    }
+  ]
+}

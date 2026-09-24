@@ -139,6 +139,57 @@ def create_v1_database(path) -> tuple[str, tuple[str, str]]:
     return paper_id, file_ids
 
 
+def create_v2_database(path) -> str:
+    paper_id = "0192e9ba-1234-7000-8000-000000000001"
+    timestamp = "2026-01-01T00:00:00Z"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE papers (
+            id TEXT PRIMARY KEY, source TEXT NOT NULL, source_key TEXT NOT NULL,
+            source_version TEXT, title TEXT NOT NULL, abstract TEXT NOT NULL,
+            authors_json TEXT NOT NULL, categories_json TEXT NOT NULL, published_at TEXT,
+            updated_at TEXT, doi TEXT, landing_url TEXT NOT NULL, pdf_url TEXT,
+            content_urls_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+            refreshed_at TEXT NOT NULL, UNIQUE(source, source_key)
+        );
+        CREATE TABLE aliases (
+            scheme TEXT NOT NULL, normalized_value TEXT NOT NULL,
+            paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL, PRIMARY KEY(scheme, normalized_value)
+        );
+        CREATE TABLE files (
+            id TEXT PRIMARY KEY, sha256 TEXT NOT NULL UNIQUE, media_type TEXT NOT NULL,
+            byte_count INTEGER NOT NULL, relative_path TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE paper_files (
+            paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+            file_id TEXT NOT NULL REFERENCES files(id),
+            format TEXT NOT NULL CHECK(format IN ('pdf', 'txt', 'xml')),
+            source_version TEXT, retrieved_at TEXT NOT NULL, source_url TEXT NOT NULL,
+            provider TEXT NOT NULL, PRIMARY KEY(paper_id, file_id)
+        );
+        CREATE INDEX papers_created_order ON papers(created_at DESC, id DESC);
+        CREATE INDEX paper_files_format ON paper_files(paper_id, format);
+        """
+    )
+    connection.execute(
+        """INSERT INTO papers VALUES (?, 'arxiv', '2301.00001', '2', 'Test', 'Abstract',
+        '["Alice"]', '["cs.AI"]', NULL, NULL, '10.1000/test',
+        'https://arxiv.org/abs/2301.00001v2', 'https://arxiv.org/pdf/2301.00001v2',
+        '{"pdf":"https://arxiv.org/pdf/2301.00001v2"}', ?, ?)""",
+        (paper_id, timestamp, timestamp),
+    )
+    connection.execute(
+        "INSERT INTO aliases VALUES ('arxiv', '2301.00001', ?, ?)", (paper_id, timestamp)
+    )
+    connection.execute("PRAGMA user_version = 2")
+    connection.commit()
+    connection.close()
+    return paper_id
+
+
 def file_records(record: dict[str, object]) -> list[dict[str, object]]:
     value = record["files"]
     assert isinstance(value, list)
@@ -273,6 +324,65 @@ def test_v1_writer_migrates_without_losing_ids_aliases_or_pdf_provenance(tmp_pat
             "SELECT file_id FROM paper_files WHERE paper_id = ?", (paper_id,)
         )
     } == set(file_ids)
+    database.close()
+
+
+def test_v2_writer_adds_pmc_metadata_columns_without_losing_identity(tmp_path) -> None:
+    path = tmp_path / "papers.sqlite3"
+    paper_id = create_v2_database(path)
+
+    database = Database(path)
+    record = database.get("arxiv:2301.00001")
+
+    assert database.schema_version == DATABASE_SCHEMA_VERSION
+    assert record["id"] == paper_id
+    assert record["pmcid"] is None
+    assert record["pmid"] is None
+    assert record["license_code"] is None
+    assert record["fulltext_availability"] == "unknown"
+    assert database.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert (
+        database.connection.execute("PRAGMA user_version").fetchone()[0] == DATABASE_SCHEMA_VERSION
+    )
+    database.close()
+
+
+def test_v2_read_only_preserves_schema_without_pmc_columns(tmp_path) -> None:
+    path = tmp_path / "papers.sqlite3"
+    paper_id = create_v2_database(path)
+    original = path.read_bytes()
+
+    database = Database(path, read_only=True)
+    record = database.get(paper_id)
+    database.close()
+
+    assert record["fulltext_availability"] == "unknown"
+    assert record["pmcid"] is None
+    assert path.read_bytes() == original
+    assert not path.with_name("papers.sqlite3-wal").exists()
+    assert not path.with_name("papers.sqlite3-shm").exists()
+
+
+def test_pmc_identifiers_license_and_availability_persist(tmp_path) -> None:
+    database = Database(tmp_path / "papers.sqlite3")
+    paper = replace(
+        sample_paper(),
+        source="pmc",
+        source_key="PMC3531190",
+        source_version="1",
+        pmcid="PMC3531190",
+        pmid="23193287",
+        license_code="CC BY-NC",
+        fulltext_availability="available",
+    )
+    paper_id = database.upsert_paper(paper)
+
+    stored = database.get(paper_id)
+
+    assert stored["pmcid"] == "PMC3531190"
+    assert stored["pmid"] == "23193287"
+    assert stored["license_code"] == "CC BY-NC"
+    assert stored["fulltext_availability"] == "available"
     database.close()
 
 
