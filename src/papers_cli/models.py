@@ -87,6 +87,7 @@ class DownloadTarget:
     media_type: str
     provider: str
     accepted_content_types: frozenset[str] = field(default_factory=frozenset)
+    source_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message": {
+    "DOI": "10.1145/3377811.3380366",
+    "title": ["Improving data scientist efficiency with provenance"],
+    "author": [{"given": "Kiran", "family": "Bhageshpur"}],
+    "published": {"date-parts": [[2020, 6, 27]]},
+    "URL": "https://doi.org/10.1145/3377811.3380366"
+  }
+}

@@ -4,7 +4,10 @@ import sqlite3
 import uuid
 from dataclasses import replace
 
+import pytest
+
 from papers_cli.db import DATABASE_SCHEMA_VERSION, LIST_PAPER_FIELDS, LOCAL_PAPER_FIELDS, Database
+from papers_cli.errors import PapersError
 from papers_cli.models import REMOTE_PAPER_FIELDS, DownloadedFile, RemotePaper
 
 
@@ -383,6 +386,33 @@ def test_pmc_identifiers_license_and_availability_persist(tmp_path) -> None:
     assert stored["pmid"] == "23193287"
     assert stored["license_code"] == "CC BY-NC"
     assert stored["fulltext_availability"] == "available"
+    database.close()
+
+
+def test_doi_conflict_between_current_doi_and_legacy_alias_is_explicit(tmp_path) -> None:
+    database = Database(tmp_path / "papers.sqlite3")
+    first = sample_paper()
+    database.upsert_paper(first)
+    database.upsert_paper(replace(first, doi="10.1000/new"))
+    database.upsert_paper(
+        replace(
+            first,
+            source="biorxiv",
+            source_key="10.1101/2024.01.01.123456",
+            doi="10.1000/test",
+        )
+    )
+
+    with pytest.raises(PapersError) as error:
+        database.get("doi:10.1000/test")
+
+    assert error.value.code == "ambiguous_ref"
+    assert error.value.details == {
+        "ref": "doi:10.1000/test",
+        "refs": ["arxiv:2301.00001", "biorxiv:10.1101/2024.01.01.123456"],
+    }
+    assert database.get("arxiv:2301.00001")["doi"] == "10.1000/new"
+    assert database.get("biorxiv:10.1101/2024.01.01.123456")["doi"] == "10.1000/test"
     database.close()
 
 

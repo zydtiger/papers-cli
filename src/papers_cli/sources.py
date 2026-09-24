@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Iterable
+from dataclasses import replace
+from html import unescape
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse, urlsplit
 from xml.etree.ElementTree import Element
 
 import httpx
@@ -15,6 +17,7 @@ from .models import DownloadTarget, RemotePaper, content_media_type
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv"
+CROSSREF_API = "https://api.crossref.org/v1/works"
 PMC_ID_CONVERTER_API = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
 PMC_ESUMMARY_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 PMC_CLOUD_HOST = "pmc-oa-opendata.s3.amazonaws.com"
@@ -24,13 +27,14 @@ PMC_OPAQUE_CONTENT_TYPES = frozenset({"binary/octet-stream"})
 ARXIV_ID = re.compile(
     r"^(?P<id>\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v(?P<version>\d+))?$", re.I
 )
-# A generic DOI is recognized only to produce a useful error for an unsupported
-# remote DOI request. Its suffix is deliberately broad: historical valid DOIs
-# include punctuation outside the bioRxiv-specific pattern. The bioRxiv adapter
-# accepts the narrower 10.1101 prefix.
+# A DOI suffix is deliberately broad: historical valid DOIs include punctuation
+# outside the bioRxiv-specific pattern. The bioRxiv adapter accepts the narrower
+# 10.1101 prefix.
 GENERIC_DOI = re.compile(r"^10\.\d{4,9}/\S+$", re.I)
 BIORXIV_DOI = re.compile(r"^10\.1101/[A-Za-z0-9._;()/:+-]+$", re.I)
 PMCID = re.compile(r"^(?P<id>PMC\d+)(?:\.(?P<version>\d+))?$", re.I)
+DOI_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+DOI_URI_HOSTS = frozenset({"doi.org", "www.doi.org", "dx.doi.org"})
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
 
@@ -57,13 +61,30 @@ def _without_source_prefix(raw: str, source: str) -> str:
     return candidate
 
 
-def _remote_doi_unsupported() -> PapersError:
-    return PapersError(
-        "unsupported_ref",
-        "Generic remote DOI lookup is not supported; use biorxiv:10.1101/DOI for "
-        "bioRxiv. A doi:DOI reference is only a local collection alias.",
-        exit_code=2,
-    )
+def normalize_doi(raw: str) -> str:
+    """Return a canonical DOI from identifier, doi: form, or doi.org URI."""
+    candidate = raw.strip()
+    if candidate.lower().startswith("doi:"):
+        candidate = candidate[4:].strip()
+    if candidate.lower().startswith(("https://", "http://")):
+        parsed = urlsplit(candidate)
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or parsed.netloc.lower() not in DOI_URI_HOSTS
+            or not parsed.path.startswith("/")
+            or parsed.path.startswith("//")
+            or DOI_PERCENT_ESCAPE.search(parsed.path)
+        ):
+            raise PapersError("invalid_ref", "Expected a valid DOI or doi.org URL", exit_code=2)
+        try:
+            candidate = unquote(parsed.path[1:], encoding="utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise PapersError(
+                "invalid_ref", "Expected a valid DOI or doi.org URL", exit_code=2
+            ) from exc
+    if not GENERIC_DOI.fullmatch(candidate):
+        raise PapersError("invalid_ref", "Expected a valid DOI", exit_code=2)
+    return candidate.lower()
 
 
 def _download_target(
@@ -427,6 +448,45 @@ class PmcAdapter:
             )
         return record
 
+    def _doi_record(self, doi: str, client: httpx.Client) -> dict[str, object] | None:
+        payload = self._json(
+            client,
+            PMC_ID_CONVERTER_API,
+            params={
+                "ids": doi,
+                "format": "json",
+                "versions": "yes",
+                "showaiid": "yes",
+                "tool": "papers_cli",
+            },
+            source="PMC ID Converter",
+        )
+        records = payload.get("records")
+        if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+            raise PapersError(
+                "source_protocol", "PMC ID Converter returned an invalid record", exit_code=4
+            )
+        record = records[0]
+        if record.get("status") == "error":
+            if record.get("errmsg") == "Identifier not found in PMC":
+                return None
+            raise PapersError(
+                "source_protocol", "PMC ID Converter could not resolve the DOI", exit_code=4
+            )
+        returned_doi = record.get("doi")
+        if returned_doi is not None and (
+            not isinstance(returned_doi, str) or normalize_doi(returned_doi) != doi
+        ):
+            raise PapersError(
+                "source_protocol", "PMC ID Converter returned a mismatched DOI", exit_code=4
+            )
+        returned = record.get("pmcid")
+        if not isinstance(returned, str) or not PMCID.fullmatch(returned):
+            raise PapersError(
+                "source_protocol", "PMC ID Converter returned an invalid PMCID", exit_code=4
+            )
+        return record
+
     def _version_from_record(
         self, record: dict[str, object], pmcid: str, requested_version: str | None
     ) -> tuple[str, bool | None]:
@@ -632,12 +692,35 @@ class PmcAdapter:
         )
 
     def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget:
-        return _download_target(
+        target = _download_target(
             paper,
             format,
             self.allowed_hosts,
             accepted_content_types=PMC_OPAQUE_CONTENT_TYPES,
         )
+        return replace(target, provider=self.source, source_version=paper.source_version)
+
+    def lookup_doi(self, doi: str, client: httpx.Client) -> RemotePaper | None:
+        record = self._doi_record(doi, client)
+        if record is None:
+            return None
+        returned = record.get("pmcid")
+        assert isinstance(returned, str)
+        pmcid = returned.upper().split(".", 1)[0]
+        versioned_pmcid, live = self._version_from_record(record, pmcid, None)
+        if live is False:
+            return self._unavailable_paper(record, pmcid, versioned_pmcid, client, "unavailable")
+        try:
+            metadata = self._json(
+                client,
+                f"{PMC_CLOUD_API}/metadata/{versioned_pmcid}.json",
+                source="PMC Cloud",
+            )
+        except PapersError as error:
+            if error.code != "not_found":
+                raise
+            return self._unavailable_paper(record, pmcid, versioned_pmcid, client, "unknown")
+        return self._paper_from_metadata(metadata, record, pmcid, versioned_pmcid)
 
     def lookup(self, raw: str, client: httpx.Client) -> RemotePaper:
         pmcid, requested_version = self._parse_ref(raw)
@@ -661,10 +744,195 @@ class PmcAdapter:
         raise PapersError("unsupported_search", "PMC keyword search is not installed", exit_code=2)
 
 
+class CrossrefAdapter:
+    source = "crossref"
+    allowed_hosts: frozenset[str] = frozenset()
+
+    def __init__(self, pmc_adapter: PmcAdapter) -> None:
+        self._pmc_adapter = pmc_adapter
+
+    def normalize_ref(self, raw: str) -> str:
+        return normalize_doi(_without_source_prefix(raw, self.source))
+
+    @staticmethod
+    def _date(message: dict[str, object]) -> str | None:
+        for field in ("published", "issued"):
+            value = message.get(field)
+            if not isinstance(value, dict):
+                continue
+            date_parts = value.get("date-parts")
+            if (
+                not isinstance(date_parts, list)
+                or not date_parts
+                or not isinstance(date_parts[0], list)
+                or not date_parts[0]
+                or not all(isinstance(part, int) for part in date_parts[0])
+            ):
+                continue
+            parts = date_parts[0]
+            if len(parts) == 1:
+                return f"{parts[0]:04d}"
+            if len(parts) == 2:
+                return f"{parts[0]:04d}-{parts[1]:02d}"
+            return f"{parts[0]:04d}-{parts[1]:02d}-{parts[2]:02d}"
+        return None
+
+    @staticmethod
+    def _authors(message: dict[str, object]) -> list[str]:
+        value = message.get("author", [])
+        if not isinstance(value, list):
+            raise PapersError("source_protocol", "Crossref returned invalid authors", exit_code=4)
+        authors: list[str] = []
+        for author in value:
+            if not isinstance(author, dict):
+                raise PapersError(
+                    "source_protocol", "Crossref returned invalid authors", exit_code=4
+                )
+            name = author.get("name")
+            if isinstance(name, str) and name.strip():
+                authors.append(" ".join(name.split()))
+                continue
+            parts = [author.get("given"), author.get("family")]
+            full_name = " ".join(
+                part.strip() for part in parts if isinstance(part, str) and part.strip()
+            )
+            if full_name:
+                authors.append(full_name)
+        return authors
+
+    @staticmethod
+    def _abstract(message: dict[str, object]) -> str:
+        value = message.get("abstract")
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise PapersError(
+                "source_protocol", "Crossref returned an invalid abstract", exit_code=4
+            )
+        return " ".join(unescape(re.sub(r"<[^>]*>", " ", value)).split())
+
+    def _metadata_paper(self, doi: str, client: httpx.Client) -> RemotePaper:
+        try:
+            response = client.get(f"{CROSSREF_API}/{quote(doi, safe='')}")
+        except httpx.HTTPError as exc:
+            raise PapersError(
+                "source_network", f"Crossref metadata request failed: {exc}", exit_code=4
+            ) from exc
+        if response.status_code == 404:
+            raise PapersError("not_found", "DOI was not found in Crossref", exit_code=3)
+        if response.status_code in {401, 403}:
+            raise PapersError(
+                "source_access",
+                f"Crossref metadata access was restricted with HTTP {response.status_code}",
+                exit_code=4,
+            )
+        if response.status_code >= 400:
+            raise PapersError(
+                "source_network",
+                f"Crossref metadata request failed with HTTP {response.status_code}",
+                exit_code=4,
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise PapersError(
+                "source_protocol", "Crossref returned invalid JSON", exit_code=4
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise PapersError("source_protocol", "Crossref returned an invalid record", exit_code=4)
+        message = payload.get("message")
+        if not isinstance(message, dict):
+            raise PapersError("source_protocol", "Crossref returned an invalid record", exit_code=4)
+        returned_doi = message.get("DOI")
+        if not isinstance(returned_doi, str) or normalize_doi(returned_doi) != doi:
+            raise PapersError("source_protocol", "Crossref returned a mismatched DOI", exit_code=4)
+        titles = message.get("title")
+        if not isinstance(titles, list) or not titles or not isinstance(titles[0], str):
+            raise PapersError("source_protocol", "Crossref returned no title", exit_code=4)
+        title = " ".join(titles[0].split())
+        if not title:
+            raise PapersError("source_protocol", "Crossref returned no title", exit_code=4)
+        url = message.get("URL")
+        if not isinstance(url, str) or not url.strip():
+            url = f"https://doi.org/{quote(doi, safe='/')}"
+        indexed = message.get("indexed")
+        updated_at = (
+            indexed.get("date-time")
+            if isinstance(indexed, dict) and isinstance(indexed.get("date-time"), str)
+            else None
+        )
+        return RemotePaper(
+            source=self.source,
+            source_key=doi,
+            source_version=None,
+            title=title,
+            abstract=self._abstract(message),
+            authors=self._authors(message),
+            categories=[],
+            published_at=self._date(message),
+            updated_at=updated_at,
+            doi=doi,
+            landing_url=url,
+            pdf_url=None,
+        )
+
+    @staticmethod
+    def _pmc_source_version(url: str, format: str) -> str:
+        parsed = urlparse(url)
+        parts = parsed.path.split("/")
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != PMC_CLOUD_HOST
+            or len(parts) != 3
+            or parts[0]
+            or not PMCID.fullmatch(parts[1])
+            or parts[2] != f"{parts[1]}.{format}"
+        ):
+            raise PapersError("storage_corrupt", "Stored PMC full-text URL is invalid", exit_code=5)
+        match = PMCID.fullmatch(parts[1])
+        assert match is not None
+        version = match.group("version")
+        if version is None:
+            raise PapersError("storage_corrupt", "Stored PMC full-text URL is invalid", exit_code=5)
+        return version
+
+    def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget:
+        target = self._pmc_adapter.download_target(paper, format)
+        return replace(target, source_version=self._pmc_source_version(target.url, format))
+
+    def lookup(self, raw: str, client: httpx.Client) -> RemotePaper:
+        doi = self.normalize_ref(raw)
+        metadata = self._metadata_paper(doi, client)
+        try:
+            pmc_paper = self._pmc_adapter.lookup_doi(doi, client)
+        except PapersError as error:
+            if error.code not in {"source_access", "source_network"}:
+                raise
+            return replace(metadata, fulltext_availability="unknown")
+        if pmc_paper is None:
+            return replace(metadata, fulltext_availability="unavailable")
+        return replace(
+            metadata,
+            pmcid=pmc_paper.pmcid,
+            pmid=pmc_paper.pmid,
+            license_code=pmc_paper.license_code,
+            fulltext_availability=pmc_paper.fulltext_availability,
+            pdf_url=pmc_paper.pdf_url,
+            content_urls=pmc_paper.content_urls,
+        )
+
+    def search(self, query: str, limit: int, client: httpx.Client) -> list[RemotePaper]:
+        raise PapersError(
+            "unsupported_search", "Crossref keyword search is not installed", exit_code=2
+        )
+
+
+_PMC_ADAPTER = PmcAdapter()
 ADAPTERS: dict[str, SourceAdapter] = {
     "arxiv": ArxivAdapter(),
     "biorxiv": BiorxivAdapter(),
-    "pmc": PmcAdapter(),
+    "pmc": _PMC_ADAPTER,
+    "crossref": CrossrefAdapter(_PMC_ADAPTER),
 }
 
 
@@ -683,18 +951,19 @@ def infer_adapter(ref: str) -> tuple[SourceAdapter, str]:
         return ADAPTERS["biorxiv"], ref
     if PMCID.fullmatch(candidate):
         return ADAPTERS["pmc"], ref
+    if candidate.lower().startswith("doi:"):
+        return ADAPTERS["crossref"], ref
+    if candidate.lower().startswith(("https://", "http://")):
+        return ADAPTERS["crossref"], ref
     if GENERIC_DOI.fullmatch(candidate):
-        raise _remote_doi_unsupported()
-    if ":" in ref:
-        source, raw = ref.split(":", 1)
-        if source.lower() == "doi":
-            raise _remote_doi_unsupported()
+        return ADAPTERS["crossref"], ref
+    if ":" in candidate:
+        source, raw = candidate.split(":", 1)
         adapter = adapter_for(source.lower())
         return adapter, raw
     raise PapersError(
         "invalid_ref",
-        "Use a UUID, arxiv:IDENTIFIER, biorxiv:10.1101/DOI, or pmc:PMCIDENTIFIER; "
-        "doi:DOI is local-only",
+        "Use a UUID, arxiv:IDENTIFIER, biorxiv:10.1101/DOI, pmc:PMCIDENTIFIER, or DOI",
         exit_code=2,
     )
 
@@ -730,5 +999,17 @@ def source_capabilities() -> Iterable[dict[str, object]]:
             "fulltext_formats": ["pdf", "txt", "xml"],
             "download": True,
             "official_api": PMC_ID_CONVERTER_API,
+        },
+        {
+            "name": "crossref",
+            "search": False,
+            "metadata_search": False,
+            "lookup": True,
+            "reference_formats": ["doi"],
+            "fulltext_formats": [],
+            "download": True,
+            "delivery_source": "pmc",
+            "delivery_formats": ["pdf", "txt", "xml"],
+            "official_api": CROSSREF_API,
         },
     )

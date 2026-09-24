@@ -9,11 +9,14 @@ import pytest
 
 from papers_cli.errors import PapersError
 from papers_cli.sources import (
+    CROSSREF_API,
     PMC_CLOUD_HOST,
     ArxivAdapter,
     BiorxivAdapter,
+    CrossrefAdapter,
     PmcAdapter,
     infer_adapter,
+    normalize_doi,
     source_capabilities,
 )
 
@@ -157,6 +160,7 @@ def test_pmc_lookup_uses_converter_then_cloud_metadata_and_all_format_targets() 
         assert target.accepted_content_types == frozenset({"binary/octet-stream"})
         assert target.url == paper.content_urls[format]
         assert target.provider == "pmc"
+        assert target.source_version == "1"
 
 
 def test_pmc_explicit_version_selects_requested_cloud_metadata() -> None:
@@ -325,17 +329,153 @@ def test_pmc_cloud_errors_are_structured(response: httpx.Response, code: str) ->
 
 
 @pytest.mark.parametrize(
-    "reference",
+    ("reference", "expected"),
     [
-        "doi:10.1000/example",
-        "10.1000/example",
-        "10.1002/(SICI)1099-0844(199612)12:4<290::AID-CBF4>3.0.CO;2-P",
+        ("doi:10.1000/example", "10.1000/example"),
+        ("10.1000/example", "10.1000/example"),
+        (
+            "10.1002/(SICI)1099-0844(199612)12:4<290::AID-CBF4>3.0.CO;2-P",
+            "10.1002/(sici)1099-0844(199612)12:4<290::aid-cbf4>3.0.co;2-p",
+        ),
+        ("https://doi.org/10.1000%2FExample?tracking=1#details", "10.1000/example"),
     ],
 )
-def test_generic_remote_doi_is_unsupported(reference: str) -> None:
-    with pytest.raises(PapersError) as error:
-        infer_adapter(reference)
-    assert error.value.code == "unsupported_ref"
+def test_generic_doi_infers_crossref_and_normalizes(reference: str, expected: str) -> None:
+    adapter, raw = infer_adapter(reference)
+    assert adapter.source == "crossref"
+    assert adapter.normalize_ref(raw) == expected
+
+
+def test_doi_url_decodes_path_once_and_raw_suffix_keeps_query_characters() -> None:
+    assert normalize_doi("https://doi.org/10.1000/%252Fexample") == "10.1000/%2fexample"
+    assert normalize_doi("10.1000/example?literal#suffix") == "10.1000/example?literal#suffix"
+
+
+def test_crossref_lookup_uses_crossref_metadata_then_mapped_pmc_fulltext() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "api.crossref.org":
+            assert str(request.url).startswith(f"{CROSSREF_API}/10.1093%2Fnar%2Fgks1195")
+            return httpx.Response(
+                200, content=(FIXTURES / "crossref-work-mapped.json").read_bytes()
+            )
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            assert dict(request.url.params) == {
+                "ids": "10.1093/nar/gks1195",
+                "format": "json",
+                "versions": "yes",
+                "showaiid": "yes",
+                "tool": "papers_cli",
+            }
+            return httpx.Response(200, content=(FIXTURES / "pmc-idconv-current.json").read_bytes())
+        assert request.url.host == PMC_CLOUD_HOST
+        return httpx.Response(
+            200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+        )
+
+    with client_for(handler) as client:
+        paper = CrossrefAdapter(PmcAdapter()).lookup("crossref:10.1093/nar/gks1195", client)
+
+    assert [request.url.host for request in requests] == [
+        "api.crossref.org",
+        "pmc.ncbi.nlm.nih.gov",
+        PMC_CLOUD_HOST,
+    ]
+    assert paper.ref == "crossref:10.1093/nar/gks1195"
+    assert paper.title == "GenBank"
+    assert paper.authors == ["David J. Benson"]
+    assert paper.abstract == "The GenBank nucleotide sequence database."
+    assert paper.published_at == "2012-11-27"
+    assert paper.content_urls.keys() == {"pdf", "txt", "xml"}
+    target = CrossrefAdapter(PmcAdapter()).download_target(paper, "xml")
+    assert target.provider == "pmc"
+    assert target.source_version == "1"
+    assert target.allowed_hosts == frozenset({PMC_CLOUD_HOST})
+
+
+def test_crossref_lookup_without_pmc_keeps_metadata_and_reports_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.crossref.org":
+            return httpx.Response(
+                200, content=(FIXTURES / "crossref-work-no-pmc.json").read_bytes()
+            )
+        assert request.url.host == "pmc.ncbi.nlm.nih.gov"
+        return httpx.Response(200, content=(FIXTURES / "pmc-idconv-doi-missing.json").read_bytes())
+
+    with client_for(handler) as client:
+        paper = CrossrefAdapter(PmcAdapter()).lookup("10.1145/3377811.3380366", client)
+        with pytest.raises(PapersError) as error:
+            CrossrefAdapter(PmcAdapter()).download_target(paper, "pdf")
+
+    assert paper.ref == "crossref:10.1145/3377811.3380366"
+    assert paper.title == "Improving data scientist efficiency with provenance"
+    assert paper.content_urls == {}
+    assert paper.fulltext_availability == "unavailable"
+    assert error.value.code == "format_unavailable"
+    assert error.value.details["availability"] == "known"
+    assert error.value.details["available_formats"] == []
+
+
+def test_crossref_mapping_access_failure_keeps_metadata_with_unknown_availability() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.crossref.org":
+            return httpx.Response(
+                200, content=(FIXTURES / "crossref-work-no-pmc.json").read_bytes()
+            )
+        assert request.url.host == "pmc.ncbi.nlm.nih.gov"
+        return httpx.Response(403)
+
+    with client_for(handler) as client:
+        paper = CrossrefAdapter(PmcAdapter()).lookup("10.1145/3377811.3380366", client)
+        with pytest.raises(PapersError) as error:
+            CrossrefAdapter(PmcAdapter()).download_target(paper, "pdf")
+
+    assert paper.content_urls == {}
+    assert paper.fulltext_availability == "unknown"
+    assert error.value.code == "format_unavailable"
+    assert error.value.details["availability"] == "unknown"
+
+
+def test_crossref_not_found_is_scoped_to_crossref() -> None:
+    with client_for(lambda _: httpx.Response(404)) as client:
+        with pytest.raises(PapersError) as error:
+            CrossrefAdapter(PmcAdapter()).lookup("10.1000/missing", client)
+    assert error.value.code == "not_found"
+    assert str(error.value) == "DOI was not found in Crossref"
+
+
+def test_crossref_network_error_is_structured() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline", request=request)
+
+    with client_for(handler) as client:
+        with pytest.raises(PapersError) as error:
+            CrossrefAdapter(PmcAdapter()).lookup("10.1000/example", client)
+    assert error.value.code == "source_network"
+
+
+def test_crossref_rejects_invalid_metadata_and_unknown_pmc_record_errors() -> None:
+    with client_for(lambda _: httpx.Response(200, json={"message": {}})) as client:
+        with pytest.raises(PapersError) as error:
+            CrossrefAdapter(PmcAdapter()).lookup("10.1000/example", client)
+    assert error.value.code == "source_protocol"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.crossref.org":
+            payload = json.loads((FIXTURES / "crossref-work-no-pmc.json").read_text())
+            payload["message"]["DOI"] = "10.1000/example"
+            return httpx.Response(200, json=payload)
+        return httpx.Response(
+            200,
+            json={"records": [{"status": "error", "errmsg": "Unexpected converter error"}]},
+        )
+
+    with client_for(handler) as client:
+        with pytest.raises(PapersError) as error:
+            CrossrefAdapter(PmcAdapter()).lookup("10.1000/example", client)
+    assert error.value.code == "source_protocol"
 
 
 def test_unqualified_biorxiv_doi_remains_a_supported_remote_reference() -> None:
@@ -381,4 +521,16 @@ def test_source_capabilities_describe_metadata_and_fulltext_formats() -> None:
         "fulltext_formats": ["pdf", "txt", "xml"],
         "download": True,
         "official_api": "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/",
+    }
+    assert capabilities["crossref"] == {
+        "name": "crossref",
+        "search": False,
+        "metadata_search": False,
+        "lookup": True,
+        "reference_formats": ["doi"],
+        "fulltext_formats": [],
+        "download": True,
+        "delivery_source": "pmc",
+        "delivery_formats": ["pdf", "txt", "xml"],
+        "official_api": "https://api.crossref.org/v1/works",
     }

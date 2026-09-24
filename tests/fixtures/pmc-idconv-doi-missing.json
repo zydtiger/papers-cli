@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "records": [
+    {
+      "doi": "10.1145/3377811.3380366",
+      "requested-id": "10.1145/3377811.3380366",
+      "status": "error",
+      "errmsg": "Identifier not found in PMC"
+    }
+  ]
+}
