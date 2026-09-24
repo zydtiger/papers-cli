@@ -86,6 +86,7 @@ class DownloadTarget:
     allowed_hosts: frozenset[str]
     media_type: str
     provider: str
+    accepted_content_types: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)

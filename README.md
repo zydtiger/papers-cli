@@ -78,7 +78,7 @@ Each imported paper has a UUIDv7 internal ID. Python 3.12 does not provide `uuid
 
 `sources.py` normalizes official provider responses into source-specific identities; `db.py` persists those records and aliases; `downloader.py` validates and stores bytes; `storage.py` verifies objects. A source identity is never automatically merged across providers, even if a DOI matches, avoiding incorrect cross-provider deduplication. File identity is SHA-256.
 
-PMC downloads use only URLs supplied by the current PMC Cloud metadata record. The provider translates its exact `s3://pmc-oa-opendata/...` object key to the equivalent allowlisted `https://pmc-oa-opendata.s3.amazonaws.com/...` retrieval URL; it never derives a publisher or PMC HTML file URL. PDF is optional in PMC Cloud metadata. A known PMC record without Cloud metadata falls back to PMC ESummary for official metadata and reports `fulltext_availability: "unknown"`; an embargoed version reports `unavailable` without attempting a file download.
+PMC downloads use only URLs supplied by the current PMC Cloud metadata record. The provider translates its exact `s3://pmc-oa-opendata/...` object key to the equivalent allowlisted `https://pmc-oa-opendata.s3.amazonaws.com/...` retrieval URL; it never derives a publisher or PMC HTML file URL. PMC Cloud uses `binary/octet-stream` for its PDF, text, and XML objects, which is accepted only for PMC targets and still undergoes the requested format's body validation. PDF is optional in PMC Cloud metadata. A known PMC record without Cloud metadata falls back to PMC ESummary for official metadata and reports `fulltext_availability: "unknown"`; an embargoed version reports `unavailable` without attempting a file download.
 
 ## Development
 

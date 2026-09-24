@@ -20,6 +20,7 @@ PMC_ESUMMARY_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 PMC_CLOUD_HOST = "pmc-oa-opendata.s3.amazonaws.com"
 PMC_CLOUD_API = f"https://{PMC_CLOUD_HOST}"
 PMC_ARTICLE_URL = "https://pmc.ncbi.nlm.nih.gov/articles"
+PMC_OPAQUE_CONTENT_TYPES = frozenset({"binary/octet-stream"})
 ARXIV_ID = re.compile(
     r"^(?P<id>\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v(?P<version>\d+))?$", re.I
 )
@@ -66,7 +67,10 @@ def _remote_doi_unsupported() -> PapersError:
 
 
 def _download_target(
-    paper: RemotePaper, format: str, allowed_hosts: frozenset[str]
+    paper: RemotePaper,
+    format: str,
+    allowed_hosts: frozenset[str],
+    accepted_content_types: frozenset[str] = frozenset(),
 ) -> DownloadTarget:
     url = paper.content_urls.get(format)
     if url is None and format == "pdf":
@@ -91,7 +95,14 @@ def _download_target(
                 "availability": availability,
             },
         )
-    return DownloadTarget(format, url, allowed_hosts, content_media_type(format), paper.source)
+    return DownloadTarget(
+        format,
+        url,
+        allowed_hosts,
+        content_media_type(format),
+        paper.source,
+        accepted_content_types,
+    )
 
 
 def _text(element: Element | None) -> str:
@@ -621,7 +632,12 @@ class PmcAdapter:
         )
 
     def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget:
-        return _download_target(paper, format, self.allowed_hosts)
+        return _download_target(
+            paper,
+            format,
+            self.allowed_hosts,
+            accepted_content_types=PMC_OPAQUE_CONTENT_TYPES,
+        )
 
     def lookup(self, raw: str, client: httpx.Client) -> RemotePaper:
         pmcid, requested_version = self._parse_ref(raw)

@@ -64,9 +64,10 @@ def _remove_staging_file(staging: Path) -> None:
         pass
 
 
-def _validate_content_type(content_type: str, format: str) -> None:
+def _validate_content_type(content_type: str, target: DownloadTarget) -> None:
+    format = target.format
     allowed = {"pdf": PDF_TYPES, "txt": TEXT_TYPES, "xml": XML_TYPES}[format]
-    if content_type in allowed:
+    if content_type in allowed or content_type in target.accepted_content_types:
         return
     if format == "pdf":
         raise PapersError(
@@ -231,7 +232,7 @@ def download_file(client: httpx.Client, target: DownloadTarget, paths: AppPaths)
                         exit_code=4,
                     )
                 content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                _validate_content_type(content_type, target.format)
+                _validate_content_type(content_type, target)
                 content_length = response.headers.get("content-length")
                 if content_length and (
                     not content_length.isdigit() or int(content_length) > MAX_BYTES

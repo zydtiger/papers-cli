@@ -154,6 +154,7 @@ def test_pmc_lookup_uses_converter_then_cloud_metadata_and_all_format_targets() 
     for format in ("pdf", "txt", "xml"):
         target = PmcAdapter().download_target(paper, format)
         assert target.allowed_hosts == frozenset({PMC_CLOUD_HOST})
+        assert target.accepted_content_types == frozenset({"binary/octet-stream"})
         assert target.url == paper.content_urls[format]
         assert target.provider == "pmc"
 

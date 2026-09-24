@@ -395,16 +395,16 @@ def test_pmc_downloads_each_official_fulltext_format(monkeypatch, tmp_path, caps
         requested_files.append(request.url.path)
         if request.url.path.endswith(".pdf"):
             return httpx.Response(
-                200, headers={"content-type": "application/pdf"}, content=pdf_bytes()
+                200, headers={"content-type": "binary/octet-stream"}, content=pdf_bytes()
             )
         if request.url.path.endswith(".txt"):
             return httpx.Response(
-                200, headers={"content-type": "text/plain"}, content=b"article text"
+                200, headers={"content-type": "binary/octet-stream"}, content=b"article text"
             )
         if request.url.path.endswith(".xml"):
             return httpx.Response(
                 200,
-                headers={"content-type": "application/xml"},
+                headers={"content-type": "binary/octet-stream"},
                 content=b"<article><body>article body</body></article>",
             )
         pytest.fail(f"unexpected request {request.url}")
