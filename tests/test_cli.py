@@ -659,6 +659,46 @@ def test_local_pmid_reference_prefers_stored_pubmed_record_without_network(
     assert [record["ref"] for record in records] == ["pubmed:23193287", "pubmed:23193287"]
 
 
+@pytest.mark.parametrize(
+    ("source", "source_key", "source_version"),
+    [
+        ("pmc", "PMC3531190", "1"),
+        ("crossref", "10.1093/nar/gks1195", None),
+    ],
+)
+def test_pmid_alias_from_another_provider_falls_through_to_pubmed_lookup(
+    monkeypatch, tmp_path, capsys, source, source_key, source_version
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/esummary.fcgi"):
+            return httpx.Response(200, content=(FIXTURES / "pubmed-esummary.json").read_bytes())
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            return httpx.Response(
+                200, content=(FIXTURES / "pmc-idconv-pmid-current.json").read_bytes()
+            )
+        assert request.url.path == "/metadata/PMC3531190.1.json"
+        return httpx.Response(
+            200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+        )
+
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    data_dir.mkdir()
+    database = Database(data_dir / "papers.sqlite3")
+    database.upsert_paper(
+        replace(
+            local_paper(source_key),
+            source=source,
+            source_version=source_version,
+            pmid="23193287",
+        )
+    )
+    database.close()
+    mock_transport(monkeypatch, handler)
+
+    assert cli.main(["lookup", "pmid:23193287", "--jsonl"]) == 0
+    assert read_jsonl_records(capsys)[0]["ref"] == "pubmed:23193287"
+
+
 def test_unresolved_doi_uses_crossref_without_creating_collection_state(
     monkeypatch, tmp_path, capsys
 ) -> None:
