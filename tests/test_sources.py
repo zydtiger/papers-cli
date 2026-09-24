@@ -395,6 +395,25 @@ def test_crossref_lookup_uses_crossref_metadata_then_mapped_pmc_fulltext() -> No
     assert target.allowed_hosts == frozenset({PMC_CLOUD_HOST})
 
 
+def test_crossref_title_flattens_inline_markup_without_inserting_spaces() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.crossref.org"
+        return httpx.Response(
+            200, content=(FIXTURES / "crossref-work-inline-title.json").read_bytes()
+        )
+
+    with client_for(handler) as client:
+        paper = CrossrefAdapter(PmcAdapter())._metadata_paper(
+            "10.1021/acsbiomaterials.0c00271", client
+        )
+
+    assert paper.title == (
+        "Efficiency of Cytosolic Delivery with Poly(β-amino ester) Nanoparticles is "
+        "Dependent on the Effective pKa of the Polymer"
+    )
+    assert CrossrefAdapter._title("p<i>K</i><sub>a</sub> &amp; delivery") == "pKa & delivery"
+
+
 def test_crossref_lookup_without_pmc_keeps_metadata_and_reports_unavailable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "api.crossref.org":

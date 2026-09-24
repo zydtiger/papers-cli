@@ -811,6 +811,11 @@ class CrossrefAdapter:
             )
         return " ".join(unescape(re.sub(r"<[^>]*>", " ", value)).split())
 
+    @staticmethod
+    def _title(value: str) -> str:
+        """Flatten title markup without separating adjacent inline text."""
+        return " ".join(unescape(re.sub(r"<[^>]*>", "", value)).split())
+
     def _metadata_paper(self, doi: str, client: httpx.Client) -> RemotePaper:
         try:
             response = client.get(f"{CROSSREF_API}/{quote(doi, safe='')}")
@@ -849,7 +854,7 @@ class CrossrefAdapter:
         titles = message.get("title")
         if not isinstance(titles, list) or not titles or not isinstance(titles[0], str):
             raise PapersError("source_protocol", "Crossref returned no title", exit_code=4)
-        title = " ".join(titles[0].split())
+        title = self._title(titles[0])
         if not title:
             raise PapersError("source_protocol", "Crossref returned no title", exit_code=4)
         url = message.get("URL")
