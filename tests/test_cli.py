@@ -35,6 +35,31 @@ def pdf_bytes(*, width: int = 72) -> bytes:
     return output.getvalue()
 
 
+def cyclic_page_tree_pdf_bytes() -> bytes:
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [2 0 R] /Count 1 >>",
+    )
+    output = BytesIO()
+    output.write(b"%PDF-1.7\n")
+    offsets = [0]
+    for identifier, object_value in enumerate(objects, start=1):
+        offsets.append(output.tell())
+        output.write(f"{identifier} 0 obj\n".encode())
+        output.write(object_value)
+        output.write(b"\nendobj\n")
+    xref_offset = output.tell()
+    output.write(f"xref\n0 {len(objects) + 1}\n".encode())
+    output.write(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.write(f"{offset:010d} 00000 n \n".encode())
+    output.write(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+    return output.getvalue()
+
+
 def local_paper(source_key: str = "2301.00001") -> RemotePaper:
     return RemotePaper(
         source="arxiv",
@@ -269,6 +294,31 @@ def test_download_rejects_malformed_pdf_without_persisting_attachment(
     database.close()
     assert not list(cache_dir.glob("downloads/download-*.part"))
     assert not list((data_dir / "objects").rglob("*.pdf"))
+
+
+def test_download_rejects_cyclic_pdf_page_tree_without_stderr(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+        if request.url.host == "arxiv.org":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/pdf"},
+                content=cyclic_page_tree_pdf_bytes(),
+            )
+        return httpx.Response(500)
+
+    mock_transport(monkeypatch, handler)
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "arxiv:2301.00001", "--jsonl"]) == 4
+    assert read_error(capsys)["code"] == "not_pdf"
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.list(None, None) == []
+    database.close()
+    assert not list(cache_dir.glob("downloads/download-*.part"))
 
 
 def test_download_silences_repairable_pdf_parser_diagnostics(monkeypatch, tmp_path, capsys) -> None:

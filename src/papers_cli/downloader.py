@@ -15,7 +15,7 @@ import httpx
 from defusedxml import ElementTree as DefusedElementTree
 from defusedxml.common import DefusedXmlException
 from pypdf import PdfReader
-from pypdf.errors import PdfReadError
+from pypdf.errors import PyPdfError
 
 from .config import AppPaths
 from .errors import PapersError
@@ -106,7 +106,7 @@ def _validate_pdf(staging: Path) -> None:
                 )
     except PapersError:
         raise
-    except (PdfReadError, ValueError, TypeError, KeyError, IndexError) as exc:
+    except (PyPdfError, ValueError, TypeError, KeyError, IndexError) as exc:
         raise PapersError(
             "not_pdf", "Provider response is not a structurally readable PDF", exit_code=4
         ) from exc
@@ -155,10 +155,7 @@ def _validate_txt(staging: Path) -> None:
                 if not initial:
                     continue
                 if not saw_text:
-                    preview = initial[:4096]
-                    if preview.casefold().startswith("<!doctype html") or HTML_DOCUMENT.match(
-                        preview
-                    ):
+                    if _looks_like_html_document(initial[:4096]):
                         raise PapersError(
                             "not_text",
                             "Provider response is an HTML document, not plain text",
@@ -171,6 +168,17 @@ def _validate_txt(staging: Path) -> None:
         ) from exc
     if not saw_text:
         raise PapersError("not_text", "Provider response does not contain text", exit_code=4)
+
+
+def _looks_like_html_document(preview: str) -> bool:
+    candidate = preview.lstrip()
+    while candidate.startswith("<!--"):
+        closing = candidate.find("-->")
+        if closing == -1:
+            return False
+        candidate = candidate[closing + 3 :].lstrip()
+    normalized = candidate.casefold()
+    return normalized.startswith("<!doctype html") or HTML_DOCUMENT.match(candidate) is not None
 
 
 def _validate_staged(staging: Path, format: str, prefix: bytes) -> None:
