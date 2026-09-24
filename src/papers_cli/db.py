@@ -10,12 +10,26 @@ from typing import Final
 
 from .errors import PapersError
 from .ids import uuid7
-from .models import REMOTE_PAPER_FIELDS, DownloadedFile, RemotePaper
+from .models import (
+    CONTENT_FORMATS,
+    REMOTE_PAPER_FIELDS,
+    DownloadedFile,
+    RemotePaper,
+    content_media_type,
+)
+
+DATABASE_SCHEMA_VERSION = 2
+LEGACY_DATABASE_SCHEMA_VERSION = 1
 
 # Top-level keys that Database._row_to_dict adds beyond the shared remote-paper
 # vocabulary; tests pin both constants to the serialized record keys.
-LOCAL_PAPER_FIELDS: Final[tuple[str, ...]] = ("id", "created_at", "refreshed_at", "file")
-
+LOCAL_PAPER_FIELDS: Final[tuple[str, ...]] = (
+    "id",
+    "created_at",
+    "refreshed_at",
+    "file",
+    "files",
+)
 LIST_PAPER_FIELDS: Final[tuple[str, ...]] = (*REMOTE_PAPER_FIELDS, *LOCAL_PAPER_FIELDS)
 
 
@@ -25,6 +39,8 @@ def _now() -> str:
 
 class Database:
     def __init__(self, path: Path, *, read_only: bool = False) -> None:
+        self.path = path
+        self.read_only = read_only
         if read_only:
             # SQLite needs its normal readonly VFS to observe committed records in an active WAL.
             # Without a WAL, immutable mode avoids creating a sidecar pair merely to read.
@@ -37,18 +53,66 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
-        if not read_only:
+        if read_only:
+            self.schema_version = self._read_schema_version()
+            self._validate_schema_version()
+        else:
             self.connection.execute("PRAGMA journal_mode = WAL")
             self._initialize()
 
     def close(self) -> None:
         self.connection.close()
 
+    def _read_schema_version(self) -> int:
+        row = self.connection.execute("PRAGMA user_version").fetchone()
+        if row is None:
+            raise PapersError(
+                "storage_unavailable",
+                "Unable to read the local collection schema version",
+                exit_code=5,
+            )
+        return int(row[0])
+
+    def _validate_schema_version(self) -> None:
+        if self.schema_version not in {
+            LEGACY_DATABASE_SCHEMA_VERSION,
+            DATABASE_SCHEMA_VERSION,
+        }:
+            raise PapersError(
+                "storage_unavailable",
+                f"Unsupported local collection schema version: {self.schema_version}",
+                exit_code=5,
+            )
+
     def _initialize(self) -> None:
-        with self.connection:
+        version = self._read_schema_version()
+        if version == 0:
+            existing = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'papers'"
+            ).fetchone()
+            if existing is not None:
+                raise PapersError(
+                    "storage_unavailable",
+                    "Local collection has no recognized schema version",
+                    exit_code=5,
+                )
+            self._create_schema_v2()
+        elif version == LEGACY_DATABASE_SCHEMA_VERSION:
+            self._migrate_v1_to_v2()
+        elif version != DATABASE_SCHEMA_VERSION:
+            raise PapersError(
+                "storage_unavailable",
+                f"Unsupported local collection schema version: {version}",
+                exit_code=5,
+            )
+        self.schema_version = DATABASE_SCHEMA_VERSION
+
+    def _create_schema_v2(self) -> None:
+        try:
             self.connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS papers (
+                f"""
+                BEGIN IMMEDIATE;
+                CREATE TABLE papers (
                     id TEXT PRIMARY KEY,
                     source TEXT NOT NULL,
                     source_key TEXT NOT NULL,
@@ -61,19 +125,20 @@ class Database:
                     updated_at TEXT,
                     doi TEXT,
                     landing_url TEXT NOT NULL,
-                    pdf_url TEXT NOT NULL,
+                    pdf_url TEXT,
+                    content_urls_json TEXT NOT NULL DEFAULT '{{}}',
                     created_at TEXT NOT NULL,
                     refreshed_at TEXT NOT NULL,
                     UNIQUE(source, source_key)
                 );
-                CREATE TABLE IF NOT EXISTS aliases (
+                CREATE TABLE aliases (
                     scheme TEXT NOT NULL,
                     normalized_value TEXT NOT NULL,
                     paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(scheme, normalized_value)
                 );
-                CREATE TABLE IF NOT EXISTS files (
+                CREATE TABLE files (
                     id TEXT PRIMARY KEY,
                     sha256 TEXT NOT NULL UNIQUE,
                     media_type TEXT NOT NULL,
@@ -81,19 +146,115 @@ class Database:
                     relative_path TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS paper_files (
+                CREATE TABLE paper_files (
                     paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
                     file_id TEXT NOT NULL REFERENCES files(id),
-                    role TEXT NOT NULL DEFAULT 'pdf',
+                    format TEXT NOT NULL CHECK(format IN ('pdf', 'txt', 'xml')),
                     source_version TEXT,
                     retrieved_at TEXT NOT NULL,
                     source_url TEXT NOT NULL,
+                    provider TEXT NOT NULL,
                     PRIMARY KEY(paper_id, file_id)
                 );
-                CREATE INDEX IF NOT EXISTS papers_created_order ON papers(created_at DESC, id DESC);
+                CREATE INDEX papers_created_order ON papers(created_at DESC, id DESC);
+                CREATE INDEX paper_files_format ON paper_files(paper_id, format);
+                PRAGMA user_version = {DATABASE_SCHEMA_VERSION};
+                COMMIT;
                 """
             )
-            self.connection.execute("PRAGMA user_version = 1")
+        except sqlite3.Error as exc:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+            raise PapersError(
+                "storage_unavailable", "Unable to initialize the local collection", exit_code=5
+            ) from exc
+
+    def _migrate_v1_to_v2(self) -> None:
+        """Upgrade in one transaction while retaining legacy attachments and identities."""
+        try:
+            self.connection.execute("PRAGMA foreign_keys = OFF")
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute(
+                """
+                CREATE TABLE papers_v2 (
+                    id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    source_key TEXT NOT NULL,
+                    source_version TEXT,
+                    title TEXT NOT NULL,
+                    abstract TEXT NOT NULL,
+                    authors_json TEXT NOT NULL,
+                    categories_json TEXT NOT NULL,
+                    published_at TEXT,
+                    updated_at TEXT,
+                    doi TEXT,
+                    landing_url TEXT NOT NULL,
+                    pdf_url TEXT,
+                    content_urls_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    refreshed_at TEXT NOT NULL,
+                    UNIQUE(source, source_key)
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                INSERT INTO papers_v2 (
+                    id, source, source_key, source_version, title, abstract,
+                    authors_json, categories_json, published_at, updated_at, doi,
+                    landing_url, pdf_url, content_urls_json, created_at, refreshed_at
+                )
+                SELECT id, source, source_key, source_version, title, abstract,
+                    authors_json, categories_json, published_at, updated_at, doi,
+                    landing_url, pdf_url, '{}', created_at, refreshed_at
+                FROM papers
+                """
+            )
+            self.connection.execute(
+                """
+                CREATE TABLE paper_files_v2 (
+                    paper_id TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+                    file_id TEXT NOT NULL REFERENCES files(id),
+                    format TEXT NOT NULL CHECK(format IN ('pdf', 'txt', 'xml')),
+                    source_version TEXT,
+                    retrieved_at TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    PRIMARY KEY(paper_id, file_id)
+                )
+                """
+            )
+            self.connection.execute(
+                """
+                INSERT INTO paper_files_v2 (
+                    paper_id, file_id, format, source_version, retrieved_at, source_url, provider
+                )
+                SELECT pf.paper_id, pf.file_id, pf.role, pf.source_version, pf.retrieved_at,
+                       pf.source_url, p.source
+                FROM paper_files pf
+                JOIN papers p ON p.id = pf.paper_id
+                """
+            )
+            self.connection.execute("DROP TABLE paper_files")
+            self.connection.execute("DROP TABLE papers")
+            self.connection.execute("ALTER TABLE papers_v2 RENAME TO papers")
+            self.connection.execute("ALTER TABLE paper_files_v2 RENAME TO paper_files")
+            self.connection.execute(
+                "CREATE INDEX papers_created_order ON papers(created_at DESC, id DESC)"
+            )
+            self.connection.execute(
+                "CREATE INDEX paper_files_format ON paper_files(paper_id, format)"
+            )
+            self.connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+            raise PapersError(
+                "storage_unavailable", "Unable to migrate the local collection", exit_code=5
+            ) from exc
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _aliases(paper: RemotePaper) -> list[tuple[str, str]]:
@@ -102,18 +263,28 @@ class Database:
             aliases.append(("doi", paper.doi.lower()))
         return aliases
 
+    @staticmethod
+    def _content_urls(paper: RemotePaper) -> dict[str, str]:
+        urls = dict(paper.content_urls)
+        if paper.pdf_url is not None:
+            urls.setdefault("pdf", paper.pdf_url)
+        if any(format not in CONTENT_FORMATS or not url for format, url in urls.items()):
+            raise PapersError("storage_corrupt", "Paper full-text URLs are invalid", exit_code=5)
+        return urls
+
     def upsert_paper(self, paper: RemotePaper) -> str:
         now = _now()
         candidate_id = uuid7()
+        content_urls = self._content_urls(paper)
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO papers (
                     id, source, source_key, source_version, title, abstract,
                     authors_json, categories_json, published_at, updated_at, doi,
-                    landing_url, pdf_url, created_at, refreshed_at
+                    landing_url, pdf_url, content_urls_json, created_at, refreshed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, source_key) DO UPDATE SET
                   source_version=excluded.source_version,
                   title=excluded.title,
@@ -125,6 +296,7 @@ class Database:
                   doi=excluded.doi,
                   landing_url=excluded.landing_url,
                   pdf_url=excluded.pdf_url,
+                  content_urls_json=excluded.content_urls_json,
                   refreshed_at=excluded.refreshed_at
                 """,
                 (
@@ -141,6 +313,7 @@ class Database:
                     paper.doi,
                     paper.landing_url,
                     paper.pdf_url,
+                    json.dumps(content_urls, sort_keys=True),
                     now,
                     now,
                 ),
@@ -163,34 +336,124 @@ class Database:
         return paper_id
 
     def attach_file(self, paper_id: str, file: DownloadedFile, source_version: str | None) -> None:
+        if file.format not in CONTENT_FORMATS or file.media_type != content_media_type(file.format):
+            raise PapersError("storage_corrupt", "Downloaded file metadata is invalid", exit_code=5)
         now = _now()
         candidate_id = uuid7()
         with self.connection:
+            provider = file.provider
+            if not provider:
+                paper_row = self.connection.execute(
+                    "SELECT source FROM papers WHERE id = ?", (paper_id,)
+                ).fetchone()
+                if paper_row is None:
+                    raise PapersError(
+                        "storage_corrupt", "Cannot attach a file to a missing paper", exit_code=5
+                    )
+                provider = str(paper_row["source"])
             self.connection.execute(
                 """INSERT OR IGNORE INTO files
                 (id, sha256, media_type, byte_count, relative_path, created_at)
-                VALUES (?, ?, 'application/pdf', ?, ?, ?)""",
-                (candidate_id, file.sha256, file.byte_count, file.relative_path, now),
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    candidate_id,
+                    file.sha256,
+                    file.media_type,
+                    file.byte_count,
+                    file.relative_path,
+                    now,
+                ),
             )
             row = self.connection.execute(
-                "SELECT id FROM files WHERE sha256 = ?", (file.sha256,)
+                "SELECT id, media_type, relative_path FROM files WHERE sha256 = ?", (file.sha256,)
             ).fetchone()
             if row is None:
                 raise PapersError(
                     "storage_corrupt", "File upsert did not persist a record", exit_code=5
                 )
+            if row["media_type"] != file.media_type or row["relative_path"] != file.relative_path:
+                raise PapersError(
+                    "storage_corrupt",
+                    "A digest is already stored with incompatible metadata",
+                    exit_code=5,
+                )
             file_id = str(row["id"])
             self.connection.execute(
-                "DELETE FROM paper_files WHERE paper_id = ? AND role = 'pdf'", (paper_id,)
+                "DELETE FROM paper_files WHERE paper_id = ? AND format = ?",
+                (paper_id, file.format),
             )
             self.connection.execute(
                 """INSERT INTO paper_files
-                (paper_id, file_id, role, source_version, retrieved_at, source_url)
-                VALUES (?, ?, 'pdf', ?, ?, ?)""",
-                (paper_id, file_id, source_version, now, file.source_url),
+                (paper_id, file_id, format, source_version, retrieved_at, source_url, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (paper_id, file_id, file.format, source_version, now, file.source_url, provider),
             )
 
+    @staticmethod
+    def _parse_content_urls(value: object, pdf_url: object) -> dict[str, str]:
+        try:
+            urls = json.loads(str(value))
+        except (TypeError, ValueError) as exc:
+            raise PapersError(
+                "storage_corrupt", "Stored full-text URLs are invalid", exit_code=5
+            ) from exc
+        if not isinstance(urls, dict) or any(
+            format not in CONTENT_FORMATS or not isinstance(url, str) or not url
+            for format, url in urls.items()
+        ):
+            raise PapersError("storage_corrupt", "Stored full-text URLs are invalid", exit_code=5)
+        result = {str(format): str(url) for format, url in urls.items()}
+        if isinstance(pdf_url, str) and pdf_url:
+            result.setdefault("pdf", pdf_url)
+        return result
+
+    def _file_records(self, paper_id: str, source: str) -> list[dict[str, object]]:
+        if self.schema_version == LEGACY_DATABASE_SCHEMA_VERSION:
+            query = """
+                SELECT f.sha256, f.media_type, f.byte_count, f.relative_path,
+                       'pdf' AS format, pf.source_version, pf.retrieved_at, pf.source_url
+                FROM paper_files pf
+                JOIN files f ON f.id = pf.file_id
+                WHERE pf.paper_id = ? AND pf.role = 'pdf'
+                ORDER BY pf.retrieved_at DESC, f.id DESC
+            """
+        else:
+            query = """
+                SELECT f.sha256, f.media_type, f.byte_count, f.relative_path,
+                       pf.format, pf.source_version, pf.retrieved_at, pf.source_url, pf.provider
+                FROM paper_files pf
+                JOIN files f ON f.id = pf.file_id
+                WHERE pf.paper_id = ?
+                ORDER BY CASE pf.format WHEN 'pdf' THEN 0 WHEN 'txt' THEN 1 ELSE 2 END,
+                         pf.retrieved_at DESC, f.id DESC
+            """
+        rows = self.connection.execute(query, (paper_id,)).fetchall()
+        records: list[dict[str, object]] = []
+        for row in rows:
+            format = str(row["format"])
+            media_type = str(row["media_type"])
+            if format not in CONTENT_FORMATS or media_type != content_media_type(format):
+                raise PapersError("storage_corrupt", "Stored file metadata is invalid", exit_code=5)
+            records.append(
+                {
+                    "format": format,
+                    "media_type": media_type,
+                    "sha256": str(row["sha256"]),
+                    "byte_count": int(row["byte_count"]),
+                    "relative_path": str(row["relative_path"]),
+                    "source": str(row["provider"]) if "provider" in row.keys() else source,
+                    "source_url": str(row["source_url"]),
+                    "source_version": row["source_version"],
+                    "retrieved_at": str(row["retrieved_at"]),
+                }
+            )
+        return records
+
     def _row_to_dict(self, row: sqlite3.Row) -> dict[str, object]:
+        content_urls = self._parse_content_urls(
+            row["content_urls_json"] if "content_urls_json" in row.keys() else "{}",
+            row["pdf_url"],
+        )
         result: dict[str, object] = {
             "id": row["id"],
             "source": row["source"],
@@ -206,26 +469,25 @@ class Database:
             "doi": row["doi"],
             "landing_url": row["landing_url"],
             "pdf_url": row["pdf_url"],
+            "content_urls": content_urls,
             "created_at": row["created_at"],
             "refreshed_at": row["refreshed_at"],
         }
-        if row["sha256"] is not None:
+        files = self._file_records(str(row["id"]), str(row["source"]))
+        result["files"] = files
+        pdf = next((file for file in files if file["format"] == "pdf"), None)
+        if pdf is not None:
             result["file"] = {
-                "sha256": row["sha256"],
-                "byte_count": row["byte_count"],
-                "relative_path": row["relative_path"],
-                "source_url": row["file_source_url"],
+                "sha256": pdf["sha256"],
+                "byte_count": pdf["byte_count"],
+                "relative_path": pdf["relative_path"],
+                "source_url": pdf["source_url"],
             }
         return result
 
     @staticmethod
     def _select() -> str:
-        return """
-        SELECT p.*, f.sha256, f.byte_count, f.relative_path, pf.source_url AS file_source_url
-        FROM papers p
-        LEFT JOIN paper_files pf ON pf.paper_id = p.id AND pf.role = 'pdf'
-        LEFT JOIN files f ON f.id = pf.file_id
-        """
+        return "SELECT p.* FROM papers p"
 
     def get(self, ref: str) -> dict[str, object]:
         row = None
@@ -265,13 +527,12 @@ class Database:
         paper_id = str(paper["id"])
         rows = self.connection.execute(
             """
-            SELECT f.id, f.sha256, f.byte_count, f.relative_path,
-                   COUNT(all_links.paper_id) AS reference_count
+            SELECT f.id, f.sha256, f.media_type, f.byte_count, f.relative_path, target.format,
+                   (SELECT COUNT(*) FROM paper_files all_links WHERE all_links.file_id = f.id)
+                       AS reference_count
             FROM paper_files target
             JOIN files f ON f.id = target.file_id
-            LEFT JOIN paper_files all_links ON all_links.file_id = f.id
             WHERE target.paper_id = ?
-            GROUP BY f.id, f.sha256, f.byte_count, f.relative_path
             ORDER BY f.id
             """,
             (paper_id,),
@@ -280,6 +541,8 @@ class Database:
             {
                 "id": str(row["id"]),
                 "sha256": str(row["sha256"]),
+                "media_type": str(row["media_type"]),
+                "format": str(row["format"]),
                 "byte_count": int(row["byte_count"]),
                 "relative_path": str(row["relative_path"]),
                 "reference_count": int(row["reference_count"]),

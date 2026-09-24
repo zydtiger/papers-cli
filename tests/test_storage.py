@@ -9,8 +9,9 @@ import pytest
 
 import papers_cli.downloader as downloader
 from papers_cli.config import AppPaths, ensure_paths
-from papers_cli.downloader import download_pdf
+from papers_cli.downloader import download_file, download_pdf
 from papers_cli.errors import PapersError
+from papers_cli.models import DownloadTarget
 
 
 def test_download_content_addresses_and_deduplicates(tmp_path, monkeypatch) -> None:
@@ -42,6 +43,67 @@ def test_download_content_addresses_and_deduplicates(tmp_path, monkeypatch) -> N
     assert staging_directories == [paths.download_cache_dir, paths.download_cache_dir]
     assert not list(paths.download_cache_dir.glob("download-*.part"))
     assert not (paths.data_dir / ".staging").exists()
+
+
+@pytest.mark.parametrize(
+    ("format", "media_type", "body", "suffix"),
+    [
+        ("txt", "text/plain", b"Research text containing CAPTCHA as a word.", ".txt"),
+        ("xml", "application/xml", b"<article><body>Text</body></article>", ".xml"),
+    ],
+)
+def test_download_stores_supported_non_pdf_formats(
+    tmp_path, format, media_type, body, suffix
+) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    target = DownloadTarget(
+        format,
+        f"https://provider.example/article.{format}",
+        frozenset({"provider.example"}),
+        media_type,
+        "provider",
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": media_type}, content=body)
+        )
+    ) as client:
+        downloaded = download_file(client, target, paths)
+    assert downloaded.format == format
+    assert downloaded.media_type == media_type
+    assert downloaded.provider == "provider"
+    assert downloaded.relative_path.endswith(suffix)
+    assert (paths.data_dir / downloaded.relative_path).read_bytes() == body
+
+
+@pytest.mark.parametrize(
+    ("format", "media_type", "body"),
+    [
+        ("txt", "text/plain", b"\n\t\r"),
+        ("xml", "application/xml", b"not markup"),
+        ("txt", "text/html", b"<html>error</html>"),
+    ],
+)
+def test_download_rejects_invalid_non_pdf_content(tmp_path, format, media_type, body) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    target = DownloadTarget(
+        format,
+        f"https://provider.example/article.{format}",
+        frozenset({"provider.example"}),
+        "text/plain" if format == "txt" else "application/xml",
+        "provider",
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": media_type}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_file(client, target, paths)
+    assert error.value.code in {"invalid_content", "invalid_content_type"}
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
 
 
 @pytest.mark.parametrize(

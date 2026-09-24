@@ -14,7 +14,13 @@ import pytest
 from papers_cli import cli
 from papers_cli.db import LIST_PAPER_FIELDS, Database
 from papers_cli.errors import PapersError
-from papers_cli.models import REMOTE_PAPER_FIELDS, DownloadedFile, RemotePaper
+from papers_cli.models import (
+    REMOTE_PAPER_FIELDS,
+    DownloadedFile,
+    RemotePaper,
+    content_media_type,
+    content_suffix,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -57,6 +63,8 @@ def seed_downloaded_paper(
     object_path.write_bytes(body)
     database = Database(data_dir / "papers.sqlite3")
     paper_id = database.upsert_paper(paper)
+    if paper.pdf_url is None:
+        raise ValueError("test helper requires a PDF URL")
     database.attach_file(
         paper_id,
         DownloadedFile(sha256, len(body), relative.as_posix(), paper.pdf_url),
@@ -75,6 +83,37 @@ def seed_verified_paper(
         sha256=hashlib.sha256(body).hexdigest(),
         body=body,
     )
+
+
+def attach_downloaded_format(
+    data_dir: Path,
+    paper_id: str,
+    *,
+    format: str,
+    body: bytes,
+    source: str = "pmc",
+    source_version: str = "1",
+) -> tuple[DownloadedFile, Path]:
+    digest = hashlib.sha256(body).hexdigest()
+    relative = (
+        Path("objects") / "sha256" / digest[:2] / digest[2:4] / f"{digest}{content_suffix(format)}"
+    )
+    path = data_dir / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    downloaded = DownloadedFile(
+        digest,
+        len(body),
+        relative.as_posix(),
+        f"https://files.example/{paper_id}.{format}",
+        format=format,
+        media_type=content_media_type(format),
+        provider=source,
+    )
+    database = Database(data_dir / "papers.sqlite3")
+    database.attach_file(paper_id, downloaded, source_version)
+    database.close()
+    return downloaded, path
 
 
 def read_jsonl(capsys: pytest.CaptureFixture[str]) -> list[dict[str, object]]:
@@ -232,6 +271,39 @@ def test_dry_run_does_not_create_collection_state(monkeypatch, tmp_path, capsys)
     assert records[0]["dry_run"] is True
     assert not data_dir.exists()
     assert not cache_dir.exists()
+
+
+def test_download_format_is_strict_and_never_falls_back_to_pdf(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+        pytest.fail("an unavailable format must not request the PDF URL")
+
+    mock_transport(monkeypatch, handler)
+    isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "arxiv:2301.00001", "--format", "txt", "--jsonl"]) == 3
+    error = read_error(capsys)
+    assert error["code"] == "format_unavailable"
+    assert error["details"] == {
+        "availability": "known",
+        "available_formats": ["pdf"],
+        "ref": "arxiv:2301.00001",
+        "requested_format": "txt",
+    }
+
+
+def test_download_rejects_unknown_format_before_network_or_collection_access(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    no_network_client(monkeypatch)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "arxiv:2301.00001", "--format", "html", "--jsonl"]) == 2
+    assert read_error(capsys)["code"] == "usage"
+    assert not data_dir.exists()
 
 
 def test_parse_errors_use_jsonl_contract_when_requested(capsys) -> None:
@@ -455,6 +527,19 @@ def test_verify_all_emits_one_jsonl_record_per_paper_at_scale(
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
+    database.attach_file(
+        "fixture-3",
+        DownloadedFile(
+            "d" * 64,
+            4,
+            "objects/sha256/dd/dd/" + "d" * 64 + ".txt",
+            "https://files.example/fixture-3.txt",
+            format="txt",
+            media_type="text/plain",
+            provider="fixture-files",
+        ),
+        None,
+    )
     database.close()
     monkeypatch.setattr(
         cli, "verify_file", lambda _paths, record: {"ref": record["ref"], "ok": True}
@@ -578,6 +663,7 @@ def test_remove_retains_shared_object(monkeypatch, tmp_path, capsys) -> None:
     second_id = database.upsert_paper(second)
     file_record = database.get(first_id)["file"]
     assert isinstance(file_record, dict)
+    assert second.pdf_url is not None
     database.attach_file(
         second_id,
         DownloadedFile(
@@ -779,6 +865,85 @@ def test_list_emits_one_record_per_paper(monkeypatch, tmp_path, capsys) -> None:
         "arxiv:2301.00001",
         "arxiv:2301.00002",
     }
+
+
+def test_list_aggregates_multiple_formats_and_preserves_legacy_pdf_file(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    paper_id, pdf_path = seed_verified_paper(data_dir, "2301.00001")
+    txt, txt_path = attach_downloaded_format(
+        data_dir, paper_id, format="txt", body=b"A plain-text full text"
+    )
+
+    assert cli.main(["list", "--fields", "ref,file,files", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert len(records) == 1
+    record = records[0]
+    legacy_file = record["file"]
+    assert isinstance(legacy_file, dict)
+    assert legacy_file["relative_path"] == str(pdf_path.relative_to(data_dir))
+    files = record["files"]
+    assert isinstance(files, list)
+    assert [file["format"] for file in files] == ["pdf", "txt"]
+    assert files[1]["source"] == "pmc"
+    assert files[1]["source_url"] == txt.source_url
+
+    assert cli.main(["path", paper_id, "--jsonl"]) == 0
+    assert read_jsonl(capsys) == [{"data": str(pdf_path), "ok": True, "schema_version": 1}]
+    assert cli.main(["path", paper_id, "--format", "txt", "--jsonl"]) == 0
+    assert read_jsonl(capsys) == [{"data": str(txt_path), "ok": True, "schema_version": 1}]
+
+    assert cli.main(["verify", paper_id, "--jsonl"]) == 0
+    verification = read_jsonl_records(capsys)
+    assert len(verification) == 1
+    assert verification[0]["status"] == "verified"
+    verified_files = verification[0]["files"]
+    assert isinstance(verified_files, list)
+    assert [file["format"] for file in verified_files if isinstance(file, dict)] == ["pdf", "txt"]
+    assert cli.main(["verify", paper_id, "--format", "txt", "--jsonl"]) == 0
+    assert read_jsonl_records(capsys)[0]["format"] == "txt"
+
+
+def test_requested_absent_format_reports_available_formats(monkeypatch, tmp_path, capsys) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    data_dir.mkdir()
+    database = Database(data_dir / "papers.sqlite3")
+    paper_id = database.upsert_paper(replace(local_paper(), pdf_url=None, content_urls={}))
+    database.close()
+    attach_downloaded_format(data_dir, paper_id, format="txt", body=b"text only")
+
+    assert cli.main(["path", paper_id, "--jsonl"]) == 3
+    error = read_error(capsys)
+    assert error["code"] == "no_file"
+    assert error["details"] == {"available_formats": ["txt"], "requested_format": "pdf"}
+
+    assert cli.main(["verify", paper_id, "--format", "xml", "--jsonl"]) == 3
+    error = read_error(capsys)
+    assert error["code"] == "no_file"
+    assert error["details"] == {"available_formats": ["txt"], "requested_format": "xml"}
+
+
+def test_remove_deletes_all_formats_and_retains_shared_text_object(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    first_id, pdf_path = seed_verified_paper(data_dir, "2301.00001")
+    text, text_path = attach_downloaded_format(
+        data_dir, first_id, format="txt", body=b"shared text"
+    )
+    database = Database(data_dir / "papers.sqlite3")
+    second_id = database.upsert_paper(local_paper("2301.00002"))
+    database.attach_file(second_id, text, "1")
+    database.close()
+
+    assert cli.main(["remove", first_id, "--jsonl"]) == 0
+    objects = read_jsonl_records(capsys)[0]["objects"]
+    assert isinstance(objects, list)
+    dispositions = {object["format"]: object["disposition"] for object in objects}
+    assert dispositions == {"pdf": "deleted", "txt": "retained_shared"}
+    assert not pdf_path.exists()
+    assert text_path.is_file()
 
 
 def test_empty_list_emits_no_jsonl_records(monkeypatch, tmp_path, capsys) -> None:
