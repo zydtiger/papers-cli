@@ -229,7 +229,7 @@ class PapersArgumentParser(argparse.ArgumentParser):
 def build_parser() -> PapersArgumentParser:
     parser = PapersArgumentParser(
         prog="papers",
-        description="Find and verify official research PDFs.",
+        description="Find and verify official research full text.",
         epilog=USAGE_EPILOG,
         allow_abbrev=False,
     )
