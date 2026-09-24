@@ -234,6 +234,10 @@ def test_download_accepts_jats_with_external_doctype_without_expansion(tmp_path)
         b"\xffnot UTF-8",
         b"<!doctype html><html><body>CAPTCHA challenge</body></html>",
         b"<!-- provider preamble -->\n<html><body>CAPTCHA challenge</body></html>",
+        *[
+            b"<!DOCTYPE" + whitespace + b"HTML><html><body>CAPTCHA challenge</body></html>"
+            for whitespace in (b" ", b"\t", b"\n", b"\f")
+        ],
     ],
 )
 def test_download_rejects_non_text_before_install(tmp_path, body) -> None:

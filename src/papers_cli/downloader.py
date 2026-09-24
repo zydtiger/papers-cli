@@ -27,6 +27,7 @@ TEXT_TYPES = {"text/plain"}
 XML_TYPES = {"application/xml", "text/xml"}
 RETRYABLE = {429, 502, 503, 504}
 HTML_DOCUMENT = re.compile(r"^<html(?:\s|/?>)", re.IGNORECASE)
+HTML_DOCTYPE = re.compile(r"^<!doctype[\t\n\f\r ]+html(?:[\t\n\f\r />]|$)", re.IGNORECASE)
 
 
 def _validate_url(url: str, allowed_hosts: frozenset[str]) -> None:
@@ -177,8 +178,7 @@ def _looks_like_html_document(preview: str) -> bool:
         if closing == -1:
             return False
         candidate = candidate[closing + 3 :].lstrip()
-    normalized = candidate.casefold()
-    return normalized.startswith("<!doctype html") or HTML_DOCUMENT.match(candidate) is not None
+    return HTML_DOCTYPE.match(candidate) is not None or HTML_DOCUMENT.match(candidate) is not None
 
 
 def _validate_staged(staging: Path, format: str, prefix: bytes) -> None:
