@@ -270,7 +270,14 @@ def test_lookup_resolves_stored_doi_alias_without_remote_doi_request(
     assert [record["ref"] for record in records] == ["arxiv:2301.00001"]
 
 
-@pytest.mark.parametrize("reference", ["doi:10.1000/test", "10.1000/test"])
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "doi:10.1000/test",
+        "10.1000/test",
+        "10.1002/(SICI)1099-0844(199612)12:4<290::AID-CBF4>3.0.CO;2-P",
+    ],
+)
 def test_unresolved_generic_doi_reports_unsupported_ref_without_collection_state(
     monkeypatch, tmp_path, capsys, reference
 ) -> None:

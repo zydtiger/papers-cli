@@ -17,8 +17,10 @@ ARXIV_ID = re.compile(
     r"^(?P<id>\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v(?P<version>\d+))?$", re.I
 )
 # A generic DOI is recognized only to produce a useful error for an unsupported
-# remote DOI request.  The bioRxiv adapter accepts the narrower 10.1101 prefix.
-GENERIC_DOI = re.compile(r"^10\.\d{4,9}/[A-Za-z0-9._;()/:+-]+$", re.I)
+# remote DOI request. Its suffix is deliberately broad: historical valid DOIs
+# include punctuation outside the bioRxiv-specific pattern. The bioRxiv adapter
+# accepts the narrower 10.1101 prefix.
+GENERIC_DOI = re.compile(r"^10\.\d{4,9}/\S+$", re.I)
 BIORXIV_DOI = re.compile(r"^10\.1101/[A-Za-z0-9._;()/:+-]+$", re.I)
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
@@ -262,18 +264,19 @@ def adapter_for(source: str) -> SourceAdapter:
 
 
 def infer_adapter(ref: str) -> tuple[SourceAdapter, str]:
+    candidate = ref.strip()
+    if ARXIV_ID.fullmatch(candidate):
+        return ADAPTERS["arxiv"], ref
+    if BIORXIV_DOI.fullmatch(candidate):
+        return ADAPTERS["biorxiv"], ref
+    if GENERIC_DOI.fullmatch(candidate):
+        raise _remote_doi_unsupported()
     if ":" in ref:
         source, raw = ref.split(":", 1)
         if source.lower() == "doi":
             raise _remote_doi_unsupported()
         adapter = adapter_for(source.lower())
         return adapter, raw
-    if ARXIV_ID.fullmatch(ref.strip()):
-        return ADAPTERS["arxiv"], ref
-    if BIORXIV_DOI.fullmatch(ref.strip()):
-        return ADAPTERS["biorxiv"], ref
-    if GENERIC_DOI.fullmatch(ref.strip()):
-        raise _remote_doi_unsupported()
     raise PapersError(
         "invalid_ref",
         "Use a UUID, arxiv:IDENTIFIER, or biorxiv:10.1101/DOI; doi:DOI is local-only",

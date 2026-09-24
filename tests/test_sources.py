@@ -83,7 +83,14 @@ def test_biorxiv_search_reports_not_found_for_valid_missing_doi() -> None:
     assert error.value.code == "not_found"
 
 
-@pytest.mark.parametrize("reference", ["doi:10.1000/example", "10.1000/example"])
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "doi:10.1000/example",
+        "10.1000/example",
+        "10.1002/(SICI)1099-0844(199612)12:4<290::AID-CBF4>3.0.CO;2-P",
+    ],
+)
 def test_generic_remote_doi_is_unsupported(reference: str) -> None:
     with pytest.raises(PapersError) as error:
         infer_adapter(reference)
