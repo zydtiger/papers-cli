@@ -3,9 +3,11 @@ name: papers-cli-skill
 description: Use the Papers CLI to discover official paper metadata, download approved PDFs, and verify a local research collection.
 ---
 
-Use `papers sources --jsonl` to discover available providers and capabilities before choosing a source.
+Use `papers sources --jsonl` to discover available providers and capabilities before choosing a source. Inspect `metadata_search`, `lookup`, `reference_formats`, and `fulltext_formats`: they respectively describe keyword metadata search, identifier lookup, supported remote identifier types, and available full-text media formats. Keep the legacy `search` and `download` fields for compatibility. bioRxiv reports `search: "doi_only"` because a valid bioRxiv DOI is delegated to lookup, while `metadata_search` is false.
 
-Use `papers search --source SOURCE --query QUERY --limit N --fields ref,title,authors --jsonl` to get normalized results. Preserve the returned `ref` when proposing or acquiring a result.
+Use `papers search --source SOURCE --query QUERY --limit N --fields ref,title,authors --jsonl` to get normalized results. Preserve the returned `ref` when proposing or acquiring a result. bioRxiv accepts only a valid `10.1101/...` DOI through this command; it reports `unsupported_search` for a keyword and `invalid_ref` for a DOI belonging to another publisher.
+
+Use source-qualified remote references such as `arxiv:2301.00001` or `biorxiv:10.1101/2024.01.01.123456`. Unqualified arXiv identifiers and valid bioRxiv `10.1101/...` DOIs remain supported. `doi:DOI` is a local collection alias only: use it only after the paper is already stored, and expect `unsupported_ref` if it cannot be resolved locally. Papers CLI has no generic remote DOI resolver, so a DOI outside bioRxiv reports `unsupported_ref`. A malformed source-qualified identifier reports `invalid_ref`; a valid remote or local identifier that is absent reports `not_found`.
 
 Use `--fields` with `search`, `lookup`, and `list` to request only the fields a workflow needs: `--fields ref,title,authors` fits discovery and approval reviews, and `papers list --fields ref,title,file --jsonl` builds a local collection manifest. Omit `--fields` when a step needs the complete record, such as reading an abstract for approval. Selections are existing top-level field names only, apply identically in human and `--jsonl` modes, and invalid selections fail as usage errors before any provider request or collection read. Keep jq for summaries and transformations that field selection cannot express.
 

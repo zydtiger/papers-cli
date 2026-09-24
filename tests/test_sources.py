@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from papers_cli.errors import PapersError
-from papers_cli.sources import ArxivAdapter, BiorxivAdapter
+from papers_cli.sources import ArxivAdapter, BiorxivAdapter, infer_adapter, source_capabilities
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -48,9 +48,73 @@ def test_biorxiv_normalizes_official_response() -> None:
 
 
 def test_biorxiv_rejects_general_search() -> None:
-    with pytest.raises(PapersError, match="DOI"):
-        BiorxivAdapter().search(
-            "genomics",
-            5,
-            httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(500))),
-        )
+    with client_for(
+        lambda _: pytest.fail("keyword search must not request the provider")
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            BiorxivAdapter().search("genomics", 5, client)
+    assert error.value.code == "unsupported_search"
+
+
+@pytest.mark.parametrize("query", ["10.1000/example", "biorxiv:not-a-doi", "10.1101/"])
+def test_biorxiv_search_rejects_invalid_doi_references(query: str) -> None:
+    with client_for(
+        lambda _: pytest.fail("invalid references must not request the provider")
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            BiorxivAdapter().search(query, 5, client)
+    assert error.value.code == "invalid_ref"
+
+
+def test_biorxiv_search_delegates_valid_doi_to_lookup() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "api.biorxiv.org"
+        return httpx.Response(200, content=(FIXTURES / "biorxiv.json").read_bytes())
+
+    with client_for(handler) as client:
+        records = BiorxivAdapter().search("10.1101/2024.01.01.123456", 5, client)
+    assert [paper.ref for paper in records] == ["biorxiv:10.1101/2024.01.01.123456"]
+
+
+def test_biorxiv_search_reports_not_found_for_valid_missing_doi() -> None:
+    with client_for(lambda _: httpx.Response(200, json={"collection": []})) as client:
+        with pytest.raises(PapersError) as error:
+            BiorxivAdapter().search("10.1101/2024.01.01.999999", 5, client)
+    assert error.value.code == "not_found"
+
+
+@pytest.mark.parametrize("reference", ["doi:10.1000/example", "10.1000/example"])
+def test_generic_remote_doi_is_unsupported(reference: str) -> None:
+    with pytest.raises(PapersError) as error:
+        infer_adapter(reference)
+    assert error.value.code == "unsupported_ref"
+
+
+def test_unqualified_biorxiv_doi_remains_a_supported_remote_reference() -> None:
+    adapter, raw = infer_adapter("10.1101/2024.01.01.123456")
+    assert adapter.source == "biorxiv"
+    assert raw == "10.1101/2024.01.01.123456"
+
+
+def test_source_capabilities_describe_metadata_and_fulltext_formats() -> None:
+    capabilities = {record["name"]: record for record in source_capabilities()}
+    assert capabilities["arxiv"] == {
+        "name": "arxiv",
+        "search": True,
+        "metadata_search": True,
+        "lookup": True,
+        "reference_formats": ["arxiv_id"],
+        "fulltext_formats": ["pdf"],
+        "download": True,
+        "official_api": "https://export.arxiv.org/api/query",
+    }
+    assert capabilities["biorxiv"] == {
+        "name": "biorxiv",
+        "search": "doi_only",
+        "metadata_search": False,
+        "lookup": True,
+        "reference_formats": ["doi"],
+        "fulltext_formats": ["pdf"],
+        "download": True,
+        "official_api": "https://api.biorxiv.org/details/biorxiv",
+    }

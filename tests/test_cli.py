@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -254,6 +255,34 @@ def test_remote_lookup_does_not_create_collection_state(monkeypatch, tmp_path, c
     assert not cache_dir.exists()
 
 
+def test_lookup_resolves_stored_doi_alias_without_remote_doi_request(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    seed_database(data_dir, replace(local_paper(), doi="10.1000/Test"))
+    mock_transport(
+        monkeypatch,
+        lambda _: pytest.fail("a stored DOI alias must not make a provider request"),
+    )
+
+    assert cli.main(["lookup", "doi:10.1000/test", "--jsonl"]) == 0
+    records = read_jsonl_records(capsys)
+    assert [record["ref"] for record in records] == ["arxiv:2301.00001"]
+
+
+@pytest.mark.parametrize("reference", ["doi:10.1000/test", "10.1000/test"])
+def test_unresolved_generic_doi_reports_unsupported_ref_without_collection_state(
+    monkeypatch, tmp_path, capsys, reference
+) -> None:
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+    mock_transport(monkeypatch, lambda _: pytest.fail("generic DOI must not request a provider"))
+
+    assert cli.main(["lookup", reference, "--jsonl"]) == 2
+    assert read_error(capsys)["code"] == "unsupported_ref"
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
 def test_dry_run_existing_database_does_not_create_wal_artifacts(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -339,6 +368,46 @@ def test_remote_search_does_not_create_collection_state(monkeypatch, tmp_path, c
     assert cli.main(["search", "--source", "arxiv", "--query", "fixture", "--jsonl"]) == 0
     records = read_jsonl_records(capsys)
     assert records[0]["ref"] == "arxiv:2301.00001"
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_code"),
+    [("genomics", "unsupported_search"), ("10.1000/example", "invalid_ref")],
+)
+def test_biorxiv_search_has_distinct_jsonl_error_contracts(
+    monkeypatch, tmp_path, capsys, query, expected_code
+) -> None:
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+    mock_transport(monkeypatch, lambda _: pytest.fail("rejected search must not request provider"))
+
+    assert cli.main(["search", "--source", "biorxiv", "--query", query, "--jsonl"]) == 2
+    assert read_error(capsys)["code"] == expected_code
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
+def test_biorxiv_search_reports_not_found_for_valid_missing_doi_jsonl(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+    mock_transport(monkeypatch, lambda _: httpx.Response(200, json={"collection": []}))
+
+    assert (
+        cli.main(
+            [
+                "search",
+                "--source",
+                "biorxiv",
+                "--query",
+                "10.1101/2024.01.01.999999",
+                "--jsonl",
+            ]
+        )
+        == 3
+    )
+    assert read_error(capsys)["code"] == "not_found"
     assert not data_dir.exists()
     assert not cache_dir.exists()
 
@@ -677,7 +746,15 @@ def test_sources_emits_one_record_per_capability(capsys) -> None:
     assert cli.main(["sources", "--jsonl"]) == 0
     records = read_jsonl_records(capsys)
     assert len(records) >= 2
-    assert {"arxiv", "biorxiv"} <= {str(record["name"]) for record in records}
+    by_name = {str(record["name"]): record for record in records}
+    assert {"arxiv", "biorxiv"} <= set(by_name)
+    assert by_name["arxiv"]["metadata_search"] is True
+    assert by_name["arxiv"]["reference_formats"] == ["arxiv_id"]
+    assert by_name["arxiv"]["fulltext_formats"] == ["pdf"]
+    assert by_name["biorxiv"]["search"] == "doi_only"
+    assert by_name["biorxiv"]["metadata_search"] is False
+    assert by_name["biorxiv"]["reference_formats"] == ["doi"]
+    assert by_name["biorxiv"]["fulltext_formats"] == ["pdf"]
 
 
 def test_list_emits_one_record_per_paper(monkeypatch, tmp_path, capsys) -> None:

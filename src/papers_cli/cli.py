@@ -45,6 +45,13 @@ MACHINE_CONTRACT_EPILOG = (
     "to stderr."
 )
 
+REFERENCE_CONTRACT_EPILOG = (
+    "Remote references are normally source-qualified (for example, arxiv:IDENTIFIER "
+    "or biorxiv:10.1101/DOI); unqualified arXiv and bioRxiv identifiers remain "
+    "supported. A doi:DOI reference is resolved only from the local collection and "
+    "is never sent to a remote DOI service."
+)
+
 VERIFY_CONTRACT_EPILOG = (
     f"{MACHINE_CONTRACT_EPILOG} Verification summaries are reported in human mode only."
 )
@@ -204,7 +211,10 @@ def build_parser() -> PapersArgumentParser:
     sources = commands.add_parser(
         "sources",
         help="List source capabilities",
-        description="List installed source capabilities, one JSONL record per source.",
+        description=(
+            "List installed source capabilities, including metadata search, lookup "
+            "reference formats, and full-text formats, one JSONL record per source."
+        ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,
     )
@@ -213,7 +223,11 @@ def build_parser() -> PapersArgumentParser:
     search = commands.add_parser(
         "search",
         help="Search a source",
-        description="Search a source's official metadata, one JSONL record per result.",
+        description=(
+            "Search a source's official metadata, one JSONL record per result. "
+            "bioRxiv accepts a valid bioRxiv DOI as a lookup convenience; keyword "
+            "search is unsupported."
+        ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,
     )
@@ -228,7 +242,8 @@ def build_parser() -> PapersArgumentParser:
         help="Look up metadata for one or more references in input order",
         description=(
             "Resolve each reference, in input order, against the local collection or "
-            "the source API, one JSONL record per reference; duplicates are preserved."
+            "the source API, one JSONL record per reference; duplicates are preserved. "
+            f"{REFERENCE_CONTRACT_EPILOG}"
         ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,
@@ -242,7 +257,7 @@ def build_parser() -> PapersArgumentParser:
         help="Download official PDFs",
         description=(
             "Download official PDFs for the given references, one JSONL record per "
-            "reference in input order."
+            f"reference in input order. {REFERENCE_CONTRACT_EPILOG}"
         ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,
