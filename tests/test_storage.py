@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import errno
 import hashlib
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
+from pypdf import PdfWriter
 
 import papers_cli.downloader as downloader
 from papers_cli.config import AppPaths, ensure_paths
@@ -14,10 +16,21 @@ from papers_cli.errors import PapersError
 from papers_cli.models import DownloadTarget
 
 
+def pdf_bytes(*, pages: int = 1, encrypted: bool = False) -> bytes:
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=72, height=72)
+    if encrypted:
+        writer.encrypt("secret")
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 def test_download_content_addresses_and_deduplicates(tmp_path, monkeypatch) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
     staging_directories: list[Path] = []
     real_mkstemp = downloader.tempfile.mkstemp
 
@@ -78,14 +91,14 @@ def test_download_stores_supported_non_pdf_formats(
 
 
 @pytest.mark.parametrize(
-    ("format", "media_type", "body"),
+    ("format", "media_type", "body", "code"),
     [
-        ("txt", "text/plain", b"\n\t\r"),
-        ("xml", "application/xml", b"not markup"),
-        ("txt", "text/html", b"<html>error</html>"),
+        ("txt", "text/plain", b"\n\t\r", "not_text"),
+        ("xml", "application/xml", b"not markup", "not_xml"),
+        ("txt", "text/html", b"<html>error</html>", "invalid_content_type"),
     ],
 )
-def test_download_rejects_invalid_non_pdf_content(tmp_path, format, media_type, body) -> None:
+def test_download_rejects_invalid_non_pdf_content(tmp_path, format, media_type, body, code) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
     target = DownloadTarget(
@@ -102,7 +115,7 @@ def test_download_rejects_invalid_non_pdf_content(tmp_path, format, media_type, 
     ) as client:
         with pytest.raises(PapersError) as error:
             download_file(client, target, paths)
-    assert error.value.code in {"invalid_content", "invalid_content_type"}
+    assert error.value.code == code
     assert not list(paths.download_cache_dir.glob("download-*.part"))
 
 
@@ -125,6 +138,130 @@ def test_download_rejects_non_pdf(tmp_path, headers, body, code) -> None:
     assert not list(paths.download_cache_dir.glob("download-*.part"))
 
 
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        (b"%PDF-1.7\nfixture", "not_pdf"),
+        (pdf_bytes(pages=0), "not_pdf"),
+        (pdf_bytes(encrypted=True), "encrypted_pdf"),
+    ],
+)
+def test_download_rejects_unreadable_pdf_before_install(tmp_path, body, code) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/pdf"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+    assert error.value.code == code
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+    assert not list(paths.objects_dir.rglob("*.pdf"))
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_download_reports_restricted_access_separately(tmp_path, status) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(status, content=b"restricted"))
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
+    assert error.value.code == "download_access"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"<error>not found</error>",
+        b"<article><front><article-meta/></front></article>",
+        b"<article><body>  </body></article>",
+        b"<!DOCTYPE article [<!ENTITY blocked SYSTEM 'file:///etc/passwd'>]><article><body>&blocked;</body></article>",
+    ],
+)
+def test_download_rejects_non_fulltext_jats_before_install(tmp_path, body) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    target = DownloadTarget(
+        "xml",
+        "https://provider.example/article.xml",
+        frozenset({"provider.example"}),
+        "application/xml",
+        "provider",
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/xml"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_file(client, target, paths)
+    assert error.value.code == "not_xml"
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+    assert not list(paths.objects_dir.rglob("*.xml"))
+
+
+def test_download_accepts_jats_with_external_doctype_without_expansion(tmp_path) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    body = (
+        b'<?xml version="1.0"?>\n'
+        b'<!DOCTYPE article SYSTEM "https://example.test/jats.dtd">\n'
+        b"<article><body><sec><p>Full text</p></sec></body></article>"
+    )
+    target = DownloadTarget(
+        "xml",
+        "https://provider.example/article.xml",
+        frozenset({"provider.example"}),
+        "application/xml",
+        "provider",
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "application/xml"}, content=body)
+        )
+    ) as client:
+        downloaded = download_file(client, target, paths)
+    assert (paths.data_dir / downloaded.relative_path).read_bytes() == body
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"\xffnot UTF-8",
+        b"<!doctype html><html><body>CAPTCHA challenge</body></html>",
+        b"<!-- provider preamble -->\n<html><body>CAPTCHA challenge</body></html>",
+        *[
+            b"<!DOCTYPE" + whitespace + b"HTML><html><body>CAPTCHA challenge</body></html>"
+            for whitespace in (b" ", b"\t", b"\n", b"\f")
+        ],
+    ],
+)
+def test_download_rejects_non_text_before_install(tmp_path, body) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    target = DownloadTarget(
+        "txt",
+        "https://provider.example/article.txt",
+        frozenset({"provider.example"}),
+        "text/plain",
+        "provider",
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers={"content-type": "text/plain"}, content=body)
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_file(client, target, paths)
+    assert error.value.code == "not_text"
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+    assert not list(paths.objects_dir.rglob("*.txt"))
+
+
 def test_download_rejects_unsafe_redirect(tmp_path) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
@@ -143,7 +280,7 @@ def test_download_reports_atomic_move_failure_and_removes_cached_part(
 ) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
 
     def fail_replace(_: Path, __: Path) -> None:
         raise OSError(errno.EXDEV, "Invalid cross-device link")
@@ -166,7 +303,7 @@ def test_download_reports_destination_directory_failure_and_removes_cached_part(
     data_file = tmp_path / "data-file"
     data_file.write_text("not a directory")
     paths = AppPaths(data_file, tmp_path / "cache")
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
 
     with httpx.Client(
         transport=httpx.MockTransport(
@@ -185,7 +322,7 @@ def test_download_reports_blocked_cache_directory_failure(tmp_path) -> None:
     cache_file = tmp_path / "cache-file"
     cache_file.write_text("not a directory")
     paths = AppPaths(tmp_path / "data", cache_file)
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
 
     with httpx.Client(
         transport=httpx.MockTransport(
@@ -201,7 +338,7 @@ def test_download_reports_blocked_cache_directory_failure(tmp_path) -> None:
 
 def test_download_reports_mkstemp_failure(tmp_path, monkeypatch) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
 
     def fail_mkstemp(**_: object) -> tuple[int, str]:
         raise OSError(errno.EACCES, "Permission denied")
@@ -222,7 +359,7 @@ def test_download_reports_mkstemp_failure(tmp_path, monkeypatch) -> None:
 def test_download_reports_temporary_file_fsync_failure(tmp_path, monkeypatch) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
 
     def fail_fsync(_: int) -> None:
         raise OSError(errno.EIO, "I/O error")
@@ -244,7 +381,7 @@ def test_download_reports_temporary_file_fsync_failure(tmp_path, monkeypatch) ->
 def test_download_keeps_installed_object_when_directory_fsync_fails(tmp_path, monkeypatch) -> None:
     paths = AppPaths(tmp_path / "data", tmp_path / "cache")
     ensure_paths(paths)
-    body = b"%PDF-1.7\nfixture"
+    body = pdf_bytes()
     real_fsync = downloader.os.fsync
     fsync_calls = 0
 

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 import time
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from xml.etree.ElementTree import ParseError
 
 import httpx
+from defusedxml import ElementTree as DefusedElementTree
+from defusedxml.common import DefusedXmlException
+from pypdf import PdfReader
+from pypdf.errors import PyPdfError
 
 from .config import AppPaths
 from .errors import PapersError
@@ -18,6 +26,8 @@ PDF_TYPES = {"application/pdf", "application/octet-stream"}
 TEXT_TYPES = {"text/plain"}
 XML_TYPES = {"application/xml", "text/xml"}
 RETRYABLE = {429, 502, 503, 504}
+HTML_DOCUMENT = re.compile(r"^<html(?:\s|/?>)", re.IGNORECASE)
+HTML_DOCTYPE = re.compile(r"^<!doctype[\t\n\f\r ]+html(?:[\t\n\f\r />]|$)", re.IGNORECASE)
 
 
 def _validate_url(url: str, allowed_hosts: frozenset[str]) -> None:
@@ -69,25 +79,116 @@ def _validate_content_type(content_type: str, format: str) -> None:
     )
 
 
-def _validate_prefix(
-    format: str, prefix: bytes, contains_nul: bool, contains_non_whitespace: bool
-) -> None:
+def _validate_prefix(format: str, prefix: bytes) -> None:
     if format == "pdf":
         if prefix[:5] != b"%PDF-":
             raise PapersError(
                 "not_pdf", "Provider response does not start with a PDF signature", exit_code=4
             )
-        return
-    if contains_nul:
+
+
+def _validate_pdf(staging: Path) -> None:
+    reader: PdfReader | None = None
+    try:
+        # pypdf emits recovery diagnostics to stderr in non-strict mode. They are
+        # parser implementation details, not CLI output, so keep them out of the
+        # JSONL stream while validating this staged provider response.
+        with redirect_stderr(StringIO()):
+            reader = PdfReader(staging, strict=False)
+            if reader.is_encrypted:
+                raise PapersError(
+                    "encrypted_pdf",
+                    "Provider response is an encrypted PDF and cannot be structurally validated",
+                    exit_code=4,
+                )
+            if len(reader.pages) < 1:
+                raise PapersError(
+                    "not_pdf", "Provider response does not contain readable PDF pages", exit_code=4
+                )
+    except PapersError:
+        raise
+    except (PyPdfError, ValueError, TypeError, KeyError, IndexError) as exc:
         raise PapersError(
-            "invalid_content", f"Provider response is not safe {format} content", exit_code=4
-        )
-    if format == "txt" and not contains_non_whitespace:
-        raise PapersError("invalid_content", "Provider response does not contain text", exit_code=4)
-    if format == "xml" and not prefix.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"<"):
+            "not_pdf", "Provider response is not a structurally readable PDF", exit_code=4
+        ) from exc
+    finally:
+        if reader is not None:
+            reader.close()
+
+
+def _local_name(tag: object) -> str:
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _validate_xml(staging: Path) -> None:
+    try:
+        root = DefusedElementTree.parse(staging).getroot()
+    except (DefusedXmlException, ParseError) as exc:
+        raise PapersError("not_xml", "Provider response is not safe JATS XML", exit_code=4) from exc
+    if root is None:
+        raise PapersError("not_xml", "Provider response is not a JATS article", exit_code=4)
+    if _local_name(root.tag) != "article":
+        raise PapersError("not_xml", "Provider response is not a JATS article", exit_code=4)
+    body = next(
+        (
+            element
+            for element in root.iter()
+            if element is not None and _local_name(element.tag) == "body"
+        ),
+        None,
+    )
+    if body is None:
         raise PapersError(
-            "invalid_content", "Provider response does not begin with XML markup", exit_code=4
+            "not_xml", "Provider response does not contain JATS article body text", exit_code=4
         )
+    if not any(text.strip() for text in body.itertext()):
+        raise PapersError(
+            "not_xml", "Provider response does not contain JATS article body text", exit_code=4
+        )
+
+
+def _validate_txt(staging: Path) -> None:
+    saw_text = False
+    try:
+        with staging.open("r", encoding="utf-8-sig") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), ""):
+                initial = chunk.lstrip()
+                if not initial:
+                    continue
+                if not saw_text:
+                    if _looks_like_html_document(initial[:4096]):
+                        raise PapersError(
+                            "not_text",
+                            "Provider response is an HTML document, not plain text",
+                            exit_code=4,
+                        )
+                saw_text = True
+    except UnicodeDecodeError as exc:
+        raise PapersError(
+            "not_text", "Provider response is not valid UTF-8 text", exit_code=4
+        ) from exc
+    if not saw_text:
+        raise PapersError("not_text", "Provider response does not contain text", exit_code=4)
+
+
+def _looks_like_html_document(preview: str) -> bool:
+    candidate = preview.lstrip()
+    while candidate.startswith("<!--"):
+        closing = candidate.find("-->")
+        if closing == -1:
+            return False
+        candidate = candidate[closing + 3 :].lstrip()
+    return HTML_DOCTYPE.match(candidate) is not None or HTML_DOCUMENT.match(candidate) is not None
+
+
+def _validate_staged(staging: Path, format: str, prefix: bytes) -> None:
+    _validate_prefix(format, prefix)
+    if format == "pdf":
+        _validate_pdf(staging)
+    elif format == "xml":
+        _validate_xml(staging)
+    elif format == "txt":
+        _validate_txt(staging)
 
 
 def download_file(client: httpx.Client, target: DownloadTarget, paths: AppPaths) -> DownloadedFile:
@@ -116,6 +217,13 @@ def download_file(client: httpx.Client, target: DownloadTarget, paths: AppPaths)
                     redirects += 1
                     attempt = 0
                     continue
+                if response.status_code in {401, 403}:
+                    raise PapersError(
+                        "download_access",
+                        f"{target.format} download access was restricted with HTTP "
+                        f"{response.status_code}",
+                        exit_code=4,
+                    )
                 if not 200 <= response.status_code < 300:
                     raise PapersError(
                         "download_network",
@@ -171,8 +279,6 @@ def _store_stream(
     digest = hashlib.sha256()
     size = 0
     prefix = bytearray()
-    contains_nul = False
-    contains_non_whitespace = False
     try:
         try:
             handle = os.fdopen(descriptor, "wb")
@@ -189,8 +295,6 @@ def _store_stream(
                         continue
                     if len(prefix) < 4096:
                         prefix.extend(chunk[: 4096 - len(prefix)])
-                    contains_nul = contains_nul or b"\x00" in chunk
-                    contains_non_whitespace = contains_non_whitespace or bool(chunk.strip())
                     size += len(chunk)
                     if size > MAX_BYTES:
                         raise PapersError(
@@ -200,13 +304,11 @@ def _store_stream(
                         )
                     digest.update(chunk)
                     handle.write(chunk)
-                _validate_prefix(
-                    target.format, bytes(prefix), contains_nul, contains_non_whitespace
-                )
                 handle.flush()
                 os.fsync(handle.fileno())
         except OSError as exc:
             raise _staging_error(target.format) from exc
+        _validate_staged(staging, target.format, bytes(prefix))
         sha256 = digest.hexdigest()
         relative = (
             Path("objects")

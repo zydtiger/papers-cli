@@ -6,10 +6,12 @@ import re
 import sqlite3
 import subprocess
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 import pytest
+from pypdf import PdfWriter
 
 from papers_cli import cli
 from papers_cli.db import LIST_PAPER_FIELDS, Database
@@ -23,6 +25,39 @@ from papers_cli.models import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def pdf_bytes(*, width: int = 72) -> bytes:
+    writer = PdfWriter()
+    writer.add_blank_page(width=width, height=72)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def cyclic_page_tree_pdf_bytes() -> bytes:
+    objects = (
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [2 0 R] /Count 1 >>",
+    )
+    output = BytesIO()
+    output.write(b"%PDF-1.7\n")
+    offsets = [0]
+    for identifier, object_value in enumerate(objects, start=1):
+        offsets.append(output.tell())
+        output.write(f"{identifier} 0 obj\n".encode())
+        output.write(object_value)
+        output.write(b"\nendobj\n")
+    xref_offset = output.tell()
+    output.write(f"xref\n0 {len(objects) + 1}\n".encode())
+    output.write(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.write(f"{offset:010d} 00000 n \n".encode())
+    output.write(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+    return output.getvalue()
 
 
 def local_paper(source_key: str = "2301.00001") -> RemotePaper:
@@ -54,8 +89,10 @@ def seed_downloaded_paper(
     paper: RemotePaper,
     *,
     sha256: str = "a" * 64,
-    body: bytes = b"%PDF-1.7\nfixture",
+    body: bytes | None = None,
 ) -> tuple[str, Path]:
+    if body is None:
+        body = pdf_bytes()
     data_dir.mkdir(exist_ok=True)
     relative = Path("objects") / "sha256" / sha256[:2] / sha256[2:4] / f"{sha256}.pdf"
     object_path = data_dir / relative
@@ -75,8 +112,10 @@ def seed_downloaded_paper(
 
 
 def seed_verified_paper(
-    data_dir: Path, source_key: str, *, body: bytes = b"%PDF-1.7\nfixture"
+    data_dir: Path, source_key: str, *, body: bytes | None = None
 ) -> tuple[str, Path]:
+    if body is None:
+        body = pdf_bytes()
     return seed_downloaded_paper(
         data_dir,
         local_paper(source_key),
@@ -190,7 +229,7 @@ def test_download_then_verify_has_stable_jsonl(monkeypatch, tmp_path, capsys) ->
             return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
         if request.url.host == "arxiv.org":
             return httpx.Response(
-                200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.7\nfixture"
+                200, headers={"content-type": "application/pdf"}, content=pdf_bytes()
             )
         return httpx.Response(500)
 
@@ -215,7 +254,7 @@ def test_download_staging_failure_has_stable_jsonl(monkeypatch, tmp_path, capsys
             return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
         if request.url.host == "arxiv.org":
             return httpx.Response(
-                200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.7\nfixture"
+                200, headers={"content-type": "application/pdf"}, content=pdf_bytes()
             )
         return httpx.Response(500)
 
@@ -229,6 +268,76 @@ def test_download_staging_failure_has_stable_jsonl(monkeypatch, tmp_path, capsys
 
     assert cli.main(["download", "arxiv:2301.00001", "--jsonl"]) == 5
     assert read_error(capsys)["code"] == "storage_staging"
+
+
+def test_download_rejects_malformed_pdf_without_persisting_attachment(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+        if request.url.host == "arxiv.org":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/pdf"},
+                content=b"%PDF-1.7\nfixture",
+            )
+        return httpx.Response(500)
+
+    mock_transport(monkeypatch, handler)
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "arxiv:2301.00001", "--jsonl"]) == 4
+    assert read_error(capsys)["code"] == "not_pdf"
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.list(None, None) == []
+    database.close()
+    assert not list(cache_dir.glob("downloads/download-*.part"))
+    assert not list((data_dir / "objects").rglob("*.pdf"))
+
+
+def test_download_rejects_cyclic_pdf_page_tree_without_stderr(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+        if request.url.host == "arxiv.org":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/pdf"},
+                content=cyclic_page_tree_pdf_bytes(),
+            )
+        return httpx.Response(500)
+
+    mock_transport(monkeypatch, handler)
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "arxiv:2301.00001", "--jsonl"]) == 4
+    assert read_error(capsys)["code"] == "not_pdf"
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    assert database.list(None, None) == []
+    database.close()
+    assert not list(cache_dir.glob("downloads/download-*.part"))
+
+
+def test_download_silences_repairable_pdf_parser_diagnostics(monkeypatch, tmp_path, capsys) -> None:
+    repaired_pdf = pdf_bytes().replace(b"startxref\n", b"startxref\n0\n%\n")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
+        if request.url.host == "arxiv.org":
+            return httpx.Response(
+                200, headers={"content-type": "application/pdf"}, content=repaired_pdf
+            )
+        return httpx.Response(500)
+
+    mock_transport(monkeypatch, handler)
+    isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "arxiv:2301.00001", "--jsonl"]) == 0
+    assert len(read_jsonl_records(capsys)) == 1
 
 
 @pytest.mark.parametrize("blocked_override", ["PAPERS_CLI_DATA_DIR", "PAPERS_CLI_CACHE_DIR"])
@@ -997,7 +1106,7 @@ def test_download_batch_preserves_duplicate_references(monkeypatch, tmp_path, ca
             return httpx.Response(200, content=(FIXTURES / "arxiv.xml").read_bytes())
         if request.url.host == "arxiv.org":
             return httpx.Response(
-                200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.7\nfixture"
+                200, headers={"content-type": "application/pdf"}, content=pdf_bytes()
             )
         return httpx.Response(500)
 
@@ -1022,7 +1131,7 @@ def test_download_batch_preserves_order_for_distinct_references(
             return httpx.Response(200, content=fixture.replace(b"2301.00001", requested.encode()))
         if request.url.host == "arxiv.org":
             return httpx.Response(
-                200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.7\nfixture"
+                200, headers={"content-type": "application/pdf"}, content=pdf_bytes()
             )
         return httpx.Response(500)
 
@@ -1039,7 +1148,7 @@ def test_download_batch_preserves_order_for_distinct_references(
 def test_path_batch_preserves_order_and_duplicates(monkeypatch, tmp_path, capsys) -> None:
     data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
     first_id, first_path = seed_verified_paper(data_dir, "2301.00001")
-    second_id, second_path = seed_verified_paper(data_dir, "2301.00002", body=b"%PDF-1.7\nsecond")
+    second_id, second_path = seed_verified_paper(data_dir, "2301.00002", body=pdf_bytes(width=73))
 
     assert cli.main(["path", first_id, second_id, first_id, "--jsonl"]) == 0
     envelopes = read_jsonl(capsys)
