@@ -14,7 +14,7 @@ from .db import LIST_PAPER_FIELDS, Database
 from .downloader import download_file
 from .errors import PapersError
 from .models import CONTENT_FORMATS, REMOTE_PAPER_FIELDS, RemotePaper
-from .sources import adapter_for, infer_adapter, source_capabilities
+from .sources import adapter_for, infer_adapter, normalize_doi, source_capabilities
 from .storage import local_path, remove_local, verify_file
 
 SCHEMA_VERSION = 1
@@ -47,9 +47,9 @@ MACHINE_CONTRACT_EPILOG = (
 
 REFERENCE_CONTRACT_EPILOG = (
     "Remote references are normally source-qualified (for example, arxiv:IDENTIFIER "
-    "biorxiv:10.1101/DOI, or pmc:PMCIDENTIFIER); unqualified arXiv, bioRxiv, and "
-    "PMC identifiers remain supported. A doi:DOI reference is resolved only from the "
-    "local collection and is never sent to a remote DOI service."
+    "biorxiv:10.1101/DOI, pmc:PMCIDENTIFIER, or crossref:DOI); unqualified arXiv, "
+    "bioRxiv, PMC, and DOI identifiers remain supported. DOI references use Crossref "
+    "metadata and may use mapped PMC full text."
 )
 
 VERIFY_CONTRACT_EPILOG = (
@@ -147,12 +147,19 @@ def _remote_from_local(record: dict[str, object]) -> RemotePaper:
     )
 
 
+def _local_ref(ref: str) -> str:
+    """Canonicalize DOI aliases before checking an existing local collection."""
+    if ref.strip().lower().startswith("doi:"):
+        return f"doi:{normalize_doi(ref)}"
+    return ref
+
+
 def _get_remote(ref: str, database: Database | None, client: httpx.Client) -> RemotePaper:
     if database is None:
         adapter, raw = infer_adapter(ref)
         return adapter.lookup(raw, client)
     try:
-        local = database.get(ref)
+        local = database.get(_local_ref(ref))
     except PapersError as error:
         if error.code != "not_found":
             raise
@@ -165,7 +172,7 @@ def _get_remote(ref: str, database: Database | None, client: httpx.Client) -> Re
 def _lookup_record(ref: str, database: Database | None, client: httpx.Client) -> dict[str, object]:
     if database is not None:
         try:
-            return database.get(ref)
+            return database.get(_local_ref(ref))
         except PapersError as error:
             if error.code != "not_found":
                 raise
@@ -489,7 +496,9 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
                     target = adapter.download_target(paper, args.format)
                     downloaded = download_file(client, target, paths)
                     paper_id = database.upsert_paper(paper)
-                    database.attach_file(paper_id, downloaded, paper.source_version)
+                    database.attach_file(
+                        paper_id, downloaded, target.source_version or paper.source_version
+                    )
                     stored.append(database.get(paper_id))
                 return stored
     finally:

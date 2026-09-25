@@ -457,6 +457,42 @@ def test_pmc_dry_run_selects_cloud_url_without_writing(monkeypatch, tmp_path, ca
     assert not cache_dir.exists()
 
 
+def test_crossref_download_persists_pmc_file_provenance(monkeypatch, tmp_path, capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.crossref.org":
+            return httpx.Response(
+                200, content=(FIXTURES / "crossref-work-mapped.json").read_bytes()
+            )
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            return httpx.Response(200, content=(FIXTURES / "pmc-idconv-current.json").read_bytes())
+        if request.url.path == "/metadata/PMC3531190.1.json":
+            return httpx.Response(
+                200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+            )
+        assert request.url.path.endswith(".txt")
+        return httpx.Response(
+            200, headers={"content-type": "binary/octet-stream"}, content=b"article text"
+        )
+
+    mock_transport(monkeypatch, handler)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "10.1093/nar/gks1195", "--format", "txt", "--jsonl"]) == 0
+    downloaded = read_jsonl_records(capsys)[0]
+    assert downloaded["ref"] == "crossref:10.1093/nar/gks1195"
+    assert downloaded["source"] == "crossref"
+
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    record = database.get("crossref:10.1093/nar/gks1195")
+    database.close()
+    files = record["files"]
+    assert isinstance(files, list)
+    assert len(files) == 1
+    assert files[0]["source"] == "pmc"
+    assert files[0]["source_version"] == "1"
+    assert str(files[0]["source_url"]).endswith("/PMC3531190.1/PMC3531190.1.txt")
+
+
 def test_download_format_is_strict_and_never_falls_back_to_pdf(
     monkeypatch, tmp_path, capsys
 ) -> None:
@@ -526,22 +562,24 @@ def test_lookup_resolves_stored_doi_alias_without_remote_doi_request(
     assert [record["ref"] for record in records] == ["arxiv:2301.00001"]
 
 
-@pytest.mark.parametrize(
-    "reference",
-    [
-        "doi:10.1000/test",
-        "10.1000/test",
-        "10.1002/(SICI)1099-0844(199612)12:4<290::AID-CBF4>3.0.CO;2-P",
-    ],
-)
-def test_unresolved_generic_doi_reports_unsupported_ref_without_collection_state(
-    monkeypatch, tmp_path, capsys, reference
+def test_unresolved_doi_uses_crossref_without_creating_collection_state(
+    monkeypatch, tmp_path, capsys
 ) -> None:
-    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
-    mock_transport(monkeypatch, lambda _: pytest.fail("generic DOI must not request a provider"))
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.crossref.org":
+            return httpx.Response(
+                200, content=(FIXTURES / "crossref-work-no-pmc.json").read_bytes()
+            )
+        assert request.url.host == "pmc.ncbi.nlm.nih.gov"
+        return httpx.Response(200, content=(FIXTURES / "pmc-idconv-doi-missing.json").read_bytes())
 
-    assert cli.main(["lookup", reference, "--jsonl"]) == 2
-    assert read_error(capsys)["code"] == "unsupported_ref"
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+    mock_transport(monkeypatch, handler)
+
+    assert cli.main(["lookup", "doi:10.1145/3377811.3380366", "--jsonl"]) == 0
+    record = read_jsonl_records(capsys)[0]
+    assert record["ref"] == "crossref:10.1145/3377811.3380366"
+    assert record["fulltext_availability"] == "unavailable"
     assert not data_dir.exists()
     assert not cache_dir.exists()
 
@@ -1306,6 +1344,16 @@ def test_subcommand_help_documents_jsonl_contract(argv, cardinality, capsys) -> 
     assert "Machine summaries and handled command or usage errors are not written to stderr" in (
         flattened
     )
+
+
+@pytest.mark.parametrize("command", ["lookup", "download"])
+def test_reference_help_documents_remote_doi_resolution(command, capsys) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main([command, "--help"])
+    assert excinfo.value.code == 0
+    flattened = " ".join(capsys.readouterr().out.split())
+    assert "crossref:DOI" in flattened
+    assert "DOI references use Crossref metadata" in flattened
 
 
 def test_verify_help_documents_human_only_summary(capsys) -> None:

@@ -551,12 +551,33 @@ class Database:
         except ValueError:
             if ":" in ref:
                 scheme, value = ref.split(":", 1)
-                row = self.connection.execute(
-                    self._select()
-                    + " JOIN aliases a ON a.paper_id = p.id"
-                    + " WHERE a.scheme = ? AND a.normalized_value = ?",
-                    (scheme.lower(), value.lower()),
-                ).fetchone()
+                normalized_scheme = scheme.lower()
+                normalized_value = value.lower()
+                if normalized_scheme == "doi":
+                    rows = self.connection.execute(
+                        self._select() + " WHERE lower(p.doi) = ? OR EXISTS ("
+                        "SELECT 1 FROM aliases a "
+                        "WHERE a.paper_id = p.id AND a.scheme = 'doi' "
+                        "AND a.normalized_value = ?"
+                        ") ORDER BY p.source, p.source_key",
+                        (normalized_value, normalized_value),
+                    ).fetchall()
+                    if len(rows) > 1:
+                        refs = [f"{item['source']}:{item['source_key']}" for item in rows]
+                        raise PapersError(
+                            "ambiguous_ref",
+                            f"DOI matches multiple local papers: {', '.join(refs)}",
+                            exit_code=3,
+                            details={"ref": f"doi:{normalized_value}", "refs": refs},
+                        ) from None
+                    row = rows[0] if rows else None
+                else:
+                    row = self.connection.execute(
+                        self._select()
+                        + " JOIN aliases a ON a.paper_id = p.id"
+                        + " WHERE a.scheme = ? AND a.normalized_value = ?",
+                        (normalized_scheme, normalized_value),
+                    ).fetchone()
         if row is None:
             raise PapersError("not_found", f"No local paper matches {ref}", exit_code=3)
         return self._row_to_dict(row)

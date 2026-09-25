@@ -1,0 +1,13 @@
+{
+  "status": "ok",
+  "message-type": "work",
+  "message": {
+    "DOI": "10.1093/nar/gks1195",
+    "title": ["GenBank"],
+    "author": [{"given": "David J.", "family": "Benson"}],
+    "abstract": "<jats:p>The GenBank nucleotide sequence database.</jats:p>",
+    "published": {"date-parts": [[2012, 11, 27]]},
+    "indexed": {"date-time": "2026-09-24T00:00:00Z"},
+    "URL": "https://doi.org/10.1093/nar/gks1195"
+  }
+}
