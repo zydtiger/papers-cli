@@ -7,16 +7,20 @@ from pathlib import Path
 import httpx
 import pytest
 
+import papers_cli.sources as sources
 from papers_cli.errors import PapersError
 from papers_cli.sources import (
     CROSSREF_API,
     PMC_CLOUD_HOST,
+    PUBMED_ESEARCH_API,
     ArxivAdapter,
     BiorxivAdapter,
     CrossrefAdapter,
     PmcAdapter,
+    PubmedAdapter,
     infer_adapter,
     normalize_doi,
+    normalize_pmid,
     source_capabilities,
 )
 
@@ -497,6 +501,187 @@ def test_crossref_rejects_invalid_metadata_and_unknown_pmc_record_errors() -> No
     assert error.value.code == "source_protocol"
 
 
+def test_pubmed_search_uses_esearch_then_one_batched_summary_in_result_order() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/esearch.fcgi"):
+            assert str(request.url) == (
+                f"{PUBMED_ESEARCH_API}?db=pubmed&term=GenBank&retmode=json&retmax=2&tool=papers_cli"
+            )
+            return httpx.Response(200, content=(FIXTURES / "pubmed-esearch.json").read_bytes())
+        assert request.url.path.endswith("/esummary.fcgi")
+        assert dict(request.url.params) == {
+            "db": "pubmed",
+            "id": "23193287,31567725",
+            "retmode": "json",
+            "tool": "papers_cli",
+        }
+        return httpx.Response(200, content=(FIXTURES / "pubmed-esummary.json").read_bytes())
+
+    with client_for(handler) as client:
+        papers = PubmedAdapter(PmcAdapter()).search("GenBank", 2, client)
+
+    assert [request.url.path.rsplit("/", 1)[-1] for request in requests] == [
+        "esearch.fcgi",
+        "esummary.fcgi",
+    ]
+    assert [paper.ref for paper in papers] == ["pubmed:23193287", "pubmed:31567725"]
+    assert papers[0].authors == ["Benson DA", "Karsch-Mizrachi I"]
+    assert papers[0].abstract == "GenBank is a nucleotide sequence database."
+    assert papers[0].doi == "10.1093/nar/gks1195"
+    assert papers[0].pmcid == "PMC3531190"
+    assert all(paper.fulltext_availability == "unknown" for paper in papers)
+
+
+def test_pubmed_search_empty_result_skips_summary_request() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/esearch.fcgi")
+        return httpx.Response(200, json={"esearchresult": {"idlist": []}})
+
+    with client_for(handler) as client:
+        assert PubmedAdapter(PmcAdapter()).search("absent", 2, client) == []
+
+
+def test_pubmed_search_enforces_requested_limit_before_batched_summary() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/esearch.fcgi"):
+            return httpx.Response(200, content=(FIXTURES / "pubmed-esearch.json").read_bytes())
+        assert request.url.params["id"] == "23193287"
+        payload = json.loads((FIXTURES / "pubmed-esummary.json").read_text())
+        result = payload["result"]
+        assert isinstance(result, dict)
+        result["uids"] = ["23193287"]
+        result.pop("31567725")
+        return httpx.Response(200, json=payload)
+
+    with client_for(handler) as client:
+        papers = PubmedAdapter(PmcAdapter()).search("GenBank", 1, client)
+    assert [paper.ref for paper in papers] == ["pubmed:23193287"]
+
+
+def test_pubmed_lookup_keeps_pubmed_metadata_and_maps_pmc_fulltext() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/esummary.fcgi"):
+            return httpx.Response(200, content=(FIXTURES / "pubmed-esummary.json").read_bytes())
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            assert request.url.params["ids"] == "23193287"
+            return httpx.Response(
+                200, content=(FIXTURES / "pmc-idconv-pmid-current.json").read_bytes()
+            )
+        assert request.url.host == PMC_CLOUD_HOST
+        return httpx.Response(
+            200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+        )
+
+    adapter = PubmedAdapter(PmcAdapter())
+    with client_for(handler) as client:
+        paper = adapter.lookup("pmid:23193287", client)
+
+    assert [request.url.host for request in requests] == [
+        "eutils.ncbi.nlm.nih.gov",
+        "pmc.ncbi.nlm.nih.gov",
+        PMC_CLOUD_HOST,
+    ]
+    assert paper.ref == "pubmed:23193287"
+    assert paper.source_version is None
+    assert paper.title == "GenBank"
+    assert paper.abstract == "GenBank is a nucleotide sequence database."
+    assert paper.published_at == "2013 Jan"
+    assert paper.doi == "10.1093/nar/gks1195"
+    assert paper.pmcid == "PMC3531190"
+    assert paper.content_urls.keys() == {"pdf", "txt", "xml"}
+    target = adapter.download_target(paper, "txt")
+    assert target.provider == "pmc"
+    assert target.source_version == "1"
+    assert target.url.endswith("/PMC3531190.1/PMC3531190.1.txt")
+
+
+def test_pubmed_lookup_without_pmc_keeps_metadata_and_reports_unavailable() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/esummary.fcgi"):
+            return httpx.Response(
+                200, content=(FIXTURES / "pubmed-esummary-no-pmc.json").read_bytes()
+            )
+        assert request.url.host == "pmc.ncbi.nlm.nih.gov"
+        return httpx.Response(200, content=(FIXTURES / "pmc-idconv-pmid-missing.json").read_bytes())
+
+    adapter = PubmedAdapter(PmcAdapter())
+    with client_for(handler) as client:
+        paper = adapter.lookup("99999999", client)
+        with pytest.raises(PapersError) as error:
+            adapter.download_target(paper, "pdf")
+
+    assert paper.ref == "pubmed:99999999"
+    assert paper.title == "Metadata-only PubMed fixture"
+    assert paper.content_urls == {}
+    assert paper.fulltext_availability == "unavailable"
+    assert error.value.code == "format_unavailable"
+    assert error.value.details["availability"] == "known"
+
+
+def test_pubmed_lookup_missing_summary_record_is_not_found() -> None:
+    with client_for(
+        lambda _: httpx.Response(
+            200, content=(FIXTURES / "pubmed-esummary-missing.json").read_bytes()
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            PubmedAdapter(PmcAdapter()).lookup("999999999", client)
+    assert error.value.code == "not_found"
+
+
+@pytest.mark.parametrize("reference", ["pmid:0", "pmid:not-a-number", "pubmed:001"])
+def test_pubmed_rejects_invalid_pmid_without_request(reference: str) -> None:
+    with client_for(lambda _: pytest.fail("invalid PMID must not request PubMed")) as client:
+        with pytest.raises(PapersError) as error:
+            PubmedAdapter(PmcAdapter()).lookup(reference, client)
+    assert error.value.code == "invalid_ref"
+
+
+def test_pubmed_retries_esearch_and_rejects_invalid_summary_ids(monkeypatch) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"esearchresult": {"idlist": ["bad"]}})
+
+    monkeypatch.setattr(sources.time, "sleep", lambda _: None)
+    with client_for(handler) as client:
+        with pytest.raises(PapersError) as error:
+            PubmedAdapter(PmcAdapter()).search("GenBank", 2, client)
+    assert attempts == 2
+    assert error.value.code == "source_protocol"
+
+
+def test_pubmed_title_normalization_matches_crossref_inline_title_handling() -> None:
+    record: dict[str, object] = {
+        "uid": "23193287",
+        "title": "Effective p<i>K</i><sub>a</sub> &amp; delivery",
+        "authors": [],
+        "articleids": [],
+    }
+    paper = PubmedAdapter(PmcAdapter())._paper_from_summary("23193287", record)
+    assert paper.title == "Effective pKa & delivery"
+
+
+def test_pmid_reference_infers_pubmed_and_normalizes() -> None:
+    adapter, raw = infer_adapter("pmid:23193287")
+    assert adapter.source == "pubmed"
+    assert adapter.normalize_ref(raw) == "23193287"
+    source_qualified, raw = infer_adapter("pubmed:23193287")
+    assert source_qualified.source == "pubmed"
+    assert raw == "23193287"
+    assert normalize_pmid("pmid:23193287") == "23193287"
+
+
 def test_unqualified_biorxiv_doi_remains_a_supported_remote_reference() -> None:
     adapter, raw = infer_adapter("10.1101/2024.01.01.123456")
     assert adapter.source == "biorxiv"
@@ -552,4 +737,16 @@ def test_source_capabilities_describe_metadata_and_fulltext_formats() -> None:
         "delivery_source": "pmc",
         "delivery_formats": ["pdf", "txt", "xml"],
         "official_api": "https://api.crossref.org/v1/works",
+    }
+    assert capabilities["pubmed"] == {
+        "name": "pubmed",
+        "search": True,
+        "metadata_search": True,
+        "lookup": True,
+        "reference_formats": ["pmid"],
+        "fulltext_formats": [],
+        "download": True,
+        "delivery_source": "pmc",
+        "delivery_formats": ["pdf", "txt", "xml"],
+        "official_api": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
     }

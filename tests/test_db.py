@@ -366,6 +366,19 @@ def test_v2_read_only_preserves_schema_without_pmc_columns(tmp_path) -> None:
     assert not path.with_name("papers.sqlite3-shm").exists()
 
 
+@pytest.mark.parametrize("create_legacy", [create_v1_database, create_v2_database])
+def test_legacy_read_only_pmid_lookup_does_not_require_pmid_column(tmp_path, create_legacy) -> None:
+    path = tmp_path / "papers.sqlite3"
+    create_legacy(path)
+
+    database = Database(path, read_only=True)
+    with pytest.raises(PapersError) as error:
+        database.get("pmid:23193287")
+    database.close()
+
+    assert error.value.code == "not_found"
+
+
 def test_pmc_identifiers_license_and_availability_persist(tmp_path) -> None:
     database = Database(tmp_path / "papers.sqlite3")
     paper = replace(

@@ -1,0 +1,29 @@
+{
+  "header": {"type": "esummary", "version": "0.3"},
+  "result": {
+    "uids": ["23193287", "31567725"],
+    "23193287": {
+      "uid": "23193287",
+      "pubdate": "2013 Jan",
+      "title": "GenBank",
+      "authors": [{"name": "Benson DA"}, {"name": "Karsch-Mizrachi I"}],
+      "abstract": "<p>GenBank is a nucleotide sequence database.</p>",
+      "articleids": [
+        {"idtype": "pubmed", "value": "23193287"},
+        {"idtype": "doi", "value": "10.1093/nar/gks1195"},
+        {"idtype": "pmc", "value": "PMC3531190"}
+      ]
+    },
+    "31567725": {
+      "uid": "31567725",
+      "pubdate": "2019 Oct",
+      "title": "Text-only PMC fixture",
+      "authors": [{"name": "Example A"}],
+      "articleids": [
+        {"idtype": "pubmed", "value": "31567725"},
+        {"idtype": "doi", "value": "10.1097/QAI.0000000000002145"},
+        {"idtype": "pmc", "value": "PMC6817404"}
+      ]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "status": "ok",
+  "records": [
+    {
+      "pmid": "99999999",
+      "requested-id": "99999999",
+      "status": "error",
+      "errmsg": "Identifier not found in PMC"
+    }
+  ]
+}

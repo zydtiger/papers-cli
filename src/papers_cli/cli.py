@@ -14,7 +14,7 @@ from .db import LIST_PAPER_FIELDS, Database
 from .downloader import download_file
 from .errors import PapersError
 from .models import CONTENT_FORMATS, REMOTE_PAPER_FIELDS, RemotePaper
-from .sources import adapter_for, infer_adapter, normalize_doi, source_capabilities
+from .sources import adapter_for, infer_adapter, normalize_doi, normalize_pmid, source_capabilities
 from .storage import local_path, remove_local, verify_file
 
 SCHEMA_VERSION = 1
@@ -47,9 +47,10 @@ MACHINE_CONTRACT_EPILOG = (
 
 REFERENCE_CONTRACT_EPILOG = (
     "Remote references are normally source-qualified (for example, arxiv:IDENTIFIER "
-    "biorxiv:10.1101/DOI, pmc:PMCIDENTIFIER, or crossref:DOI); unqualified arXiv, "
-    "bioRxiv, PMC, and DOI identifiers remain supported. DOI references use Crossref "
-    "metadata and may use mapped PMC full text."
+    "biorxiv:10.1101/DOI, pmc:PMCIDENTIFIER, crossref:DOI, or pubmed:PMID); "
+    "unqualified arXiv, bioRxiv, PMC, and DOI identifiers remain supported. DOI "
+    "references use Crossref metadata, and pmid:PMID uses PubMed metadata; each may "
+    "use mapped PMC full text."
 )
 
 VERIFY_CONTRACT_EPILOG = (
@@ -151,6 +152,8 @@ def _local_ref(ref: str) -> str:
     """Canonicalize DOI aliases before checking an existing local collection."""
     if ref.strip().lower().startswith("doi:"):
         return f"doi:{normalize_doi(ref)}"
+    if ref.strip().lower().startswith("pmid:"):
+        return f"pmid:{normalize_pmid(ref)}"
     return ref
 
 
@@ -268,7 +271,8 @@ def build_parser() -> PapersArgumentParser:
         "search",
         help="Search a source",
         description=(
-            "Search a source's official metadata, one JSONL record per result. "
+            "Search a source's official metadata, one JSONL record per result. PubMed "
+            "supports keyword metadata search. "
             "bioRxiv accepts a valid bioRxiv DOI as a lookup convenience; keyword "
             "search is unsupported."
         ),

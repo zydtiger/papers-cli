@@ -571,6 +571,11 @@ class Database:
                             details={"ref": f"doi:{normalized_value}", "refs": refs},
                         ) from None
                     row = rows[0] if rows else None
+                elif normalized_scheme == "pmid":
+                    row = self.connection.execute(
+                        self._select() + " WHERE p.source = 'pubmed' AND p.source_key = ?",
+                        (normalized_value,),
+                    ).fetchone()
                 else:
                     row = self.connection.execute(
                         self._select()
