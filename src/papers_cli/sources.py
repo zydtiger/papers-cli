@@ -16,7 +16,12 @@ BIORXIV_API = "https://api.biorxiv.org/details/biorxiv"
 ARXIV_ID = re.compile(
     r"^(?P<id>\d{4}\.\d{4,5}|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:v(?P<version>\d+))?$", re.I
 )
-DOI = re.compile(r"^10\.1101/[A-Za-z0-9._;()/:+-]+$", re.I)
+# A generic DOI is recognized only to produce a useful error for an unsupported
+# remote DOI request. Its suffix is deliberately broad: historical valid DOIs
+# include punctuation outside the bioRxiv-specific pattern. The bioRxiv adapter
+# accepts the narrower 10.1101 prefix.
+GENERIC_DOI = re.compile(r"^10\.\d{4,9}/\S+$", re.I)
+BIORXIV_DOI = re.compile(r"^10\.1101/[A-Za-z0-9._;()/:+-]+$", re.I)
 ATOM = "{http://www.w3.org/2005/Atom}"
 ARXIV = "{http://arxiv.org/schemas/atom}"
 
@@ -30,6 +35,24 @@ class SourceAdapter(Protocol):
     def lookup(self, raw: str, client: httpx.Client) -> RemotePaper: ...
 
     def search(self, query: str, limit: int, client: httpx.Client) -> list[RemotePaper]: ...
+
+
+def _without_source_prefix(raw: str, source: str) -> str:
+    """Remove an optional source prefix without making it case-sensitive."""
+    candidate = raw.strip()
+    prefix = f"{source}:"
+    if candidate.lower().startswith(prefix):
+        return candidate[len(prefix) :].strip()
+    return candidate
+
+
+def _remote_doi_unsupported() -> PapersError:
+    return PapersError(
+        "unsupported_ref",
+        "Generic remote DOI lookup is not supported; use biorxiv:10.1101/DOI for "
+        "bioRxiv. A doi:DOI reference is only a local collection alias.",
+        exit_code=2,
+    )
 
 
 def _text(element: Element | None) -> str:
@@ -63,7 +86,7 @@ class ArxivAdapter:
     allowed_hosts = frozenset({"export.arxiv.org", "arxiv.org"})
 
     def normalize_ref(self, raw: str) -> str:
-        candidate = raw.removeprefix("arxiv:").strip()
+        candidate = _without_source_prefix(raw, self.source)
         match = ARXIV_ID.fullmatch(candidate)
         if not match:
             raise PapersError("invalid_ref", "Expected a valid arXiv identifier", exit_code=2)
@@ -155,8 +178,8 @@ class BiorxivAdapter:
     allowed_hosts = frozenset({"api.biorxiv.org", "www.biorxiv.org"})
 
     def normalize_ref(self, raw: str) -> str:
-        candidate = raw.removeprefix("biorxiv:").strip()
-        if not DOI.fullmatch(candidate):
+        candidate = _without_source_prefix(raw, self.source)
+        if not BIORXIV_DOI.fullmatch(candidate):
             raise PapersError(
                 "invalid_ref", "Expected a bioRxiv DOI beginning with 10.1101/", exit_code=2
             )
@@ -217,13 +240,17 @@ class BiorxivAdapter:
 
     def search(self, query: str, limit: int, client: httpx.Client) -> list[RemotePaper]:
         # bioRxiv's official API is DOI/detail oriented, not a general-search API.
-        if not DOI.fullmatch(query.removeprefix("biorxiv:").strip()):
-            raise PapersError(
-                "unsupported_search",
-                "bioRxiv official API search currently supports DOI lookup only",
-                exit_code=2,
-            )
-        return [self.lookup(query, client)]
+        stripped_query = query.strip()
+        candidate = _without_source_prefix(stripped_query, self.source)
+        if stripped_query.lower().startswith("biorxiv:") or candidate.lower().startswith("10."):
+            # Preserve the historical DOI lookup convenience while making a DOI for
+            # another publisher an invalid bioRxiv reference rather than a search error.
+            return [self.lookup(candidate, client)]
+        raise PapersError(
+            "unsupported_search",
+            "bioRxiv official API search currently supports DOI lookup only",
+            exit_code=2,
+        )
 
 
 ADAPTERS: dict[str, SourceAdapter] = {"arxiv": ArxivAdapter(), "biorxiv": BiorxivAdapter()}
@@ -237,16 +264,23 @@ def adapter_for(source: str) -> SourceAdapter:
 
 
 def infer_adapter(ref: str) -> tuple[SourceAdapter, str]:
+    candidate = ref.strip()
+    if ARXIV_ID.fullmatch(candidate):
+        return ADAPTERS["arxiv"], ref
+    if BIORXIV_DOI.fullmatch(candidate):
+        return ADAPTERS["biorxiv"], ref
+    if GENERIC_DOI.fullmatch(candidate):
+        raise _remote_doi_unsupported()
     if ":" in ref:
         source, raw = ref.split(":", 1)
+        if source.lower() == "doi":
+            raise _remote_doi_unsupported()
         adapter = adapter_for(source.lower())
         return adapter, raw
-    if ARXIV_ID.fullmatch(ref.strip()):
-        return ADAPTERS["arxiv"], ref
-    if DOI.fullmatch(ref.strip()):
-        return ADAPTERS["biorxiv"], ref
     raise PapersError(
-        "invalid_ref", "Use a UUID, arxiv:IDENTIFIER, or biorxiv:10.1101/DOI", exit_code=2
+        "invalid_ref",
+        "Use a UUID, arxiv:IDENTIFIER, or biorxiv:10.1101/DOI; doi:DOI is local-only",
+        exit_code=2,
     )
 
 
@@ -255,14 +289,20 @@ def source_capabilities() -> Iterable[dict[str, object]]:
         {
             "name": "arxiv",
             "search": True,
+            "metadata_search": True,
             "lookup": True,
+            "reference_formats": ["arxiv_id"],
+            "fulltext_formats": ["pdf"],
             "download": True,
             "official_api": ARXIV_API,
         },
         {
             "name": "biorxiv",
             "search": "doi_only",
+            "metadata_search": False,
             "lookup": True,
+            "reference_formats": ["doi"],
+            "fulltext_formats": ["pdf"],
             "download": True,
             "official_api": BIORXIV_API,
         },
