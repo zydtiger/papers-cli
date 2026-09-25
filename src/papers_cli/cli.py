@@ -11,9 +11,9 @@ import httpx
 
 from .config import ensure_paths, get_paths
 from .db import LIST_PAPER_FIELDS, Database
-from .downloader import download_pdf
+from .downloader import download_file
 from .errors import PapersError
-from .models import REMOTE_PAPER_FIELDS, RemotePaper
+from .models import CONTENT_FORMATS, REMOTE_PAPER_FIELDS, RemotePaper
 from .sources import adapter_for, infer_adapter, source_capabilities
 from .storage import local_path, remove_local, verify_file
 
@@ -106,6 +106,18 @@ def _remote_from_local(record: dict[str, object]) -> RemotePaper:
     categories = record["categories"]
     if not isinstance(authors, list) or not isinstance(categories, list):
         raise PapersError("storage_corrupt", "Local metadata lists are invalid", exit_code=5)
+    pdf_url = record["pdf_url"]
+    content_urls = record.get("content_urls", {})
+    if (
+        pdf_url is not None
+        and not isinstance(pdf_url, str)
+        or not isinstance(content_urls, dict)
+        or any(
+            not isinstance(format, str) or not isinstance(url, str)
+            for format, url in content_urls.items()
+        )
+    ):
+        raise PapersError("storage_corrupt", "Local full-text metadata is invalid", exit_code=5)
     return RemotePaper(
         source=str(record["source"]),
         source_key=str(record["source_key"]),
@@ -120,7 +132,8 @@ def _remote_from_local(record: dict[str, object]) -> RemotePaper:
         updated_at=str(record["updated_at"]) if record["updated_at"] is not None else None,
         doi=str(record["doi"]) if record["doi"] is not None else None,
         landing_url=str(record["landing_url"]),
-        pdf_url=str(record["pdf_url"]),
+        pdf_url=pdf_url,
+        content_urls={str(format): str(url) for format, url in content_urls.items()},
     )
 
 
@@ -148,6 +161,20 @@ def _lookup_record(ref: str, database: Database | None, client: httpx.Client) ->
                 raise
     adapter, raw = infer_adapter(ref)
     return adapter.lookup(raw, client).as_dict()
+
+
+def _dry_run_record(paper: RemotePaper, format: str) -> dict[str, object]:
+    target = adapter_for(paper.source).download_target(paper, format)
+    record: dict[str, object] = {
+        "ref": paper.ref,
+        "dry_run": True,
+        "format": target.format,
+        "media_type": target.media_type,
+        "source_url": target.url,
+    }
+    if format == "pdf":
+        record["pdf_url"] = target.url
+    return record
 
 
 def _fields_help(command: str) -> str:
@@ -202,7 +229,7 @@ class PapersArgumentParser(argparse.ArgumentParser):
 def build_parser() -> PapersArgumentParser:
     parser = PapersArgumentParser(
         prog="papers",
-        description="Find and verify official research PDFs.",
+        description="Find and verify official research full text.",
         epilog=USAGE_EPILOG,
         allow_abbrev=False,
     )
@@ -254,15 +281,22 @@ def build_parser() -> PapersArgumentParser:
 
     download = commands.add_parser(
         "download",
-        help="Download official PDFs",
+        help="Download official full text",
         description=(
-            "Download official PDFs for the given references, one JSONL record per "
+            "Download one requested official full-text format for the given references, one "
+            "JSONL record per "
             f"reference in input order. {REFERENCE_CONTRACT_EPILOG}"
         ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,
     )
     download.add_argument("refs", nargs="+")
+    download.add_argument(
+        "--format",
+        choices=CONTENT_FORMATS,
+        default="pdf",
+        help="full-text format to download (default: pdf); no conversion or fallback is used",
+    )
     download.add_argument("--dry-run", action="store_true")
     download.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
@@ -280,15 +314,21 @@ def build_parser() -> PapersArgumentParser:
 
     path = commands.add_parser(
         "path",
-        help="Print local PDF paths for one or more references in input order",
+        help="Print local full-text paths for one or more references in input order",
         description=(
-            "Print the local PDF path for each reference in input order, one JSONL "
+            "Print the selected local full-text path for each reference in input order, one JSONL "
             "record per reference."
         ),
         epilog=MACHINE_CONTRACT_EPILOG,
         allow_abbrev=False,
     )
     path.add_argument("refs", nargs="+")
+    path.add_argument(
+        "--format",
+        choices=CONTENT_FORMATS,
+        default="pdf",
+        help="stored full-text format to print (default: pdf)",
+    )
     path.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
 
     remove = commands.add_parser(
@@ -306,9 +346,9 @@ def build_parser() -> PapersArgumentParser:
 
     verify = commands.add_parser(
         "verify",
-        help="Verify downloaded PDFs for references or the whole collection",
+        help="Verify downloaded full text for references or the whole collection",
         description=(
-            "Verify stored PDFs for the given references or the whole collection, one "
+            "Verify stored full text for the given references or the whole collection, one "
             "JSONL record per paper and no machine summary record."
         ),
         epilog=VERIFY_CONTRACT_EPILOG,
@@ -316,6 +356,11 @@ def build_parser() -> PapersArgumentParser:
     )
     verify.add_argument("refs", nargs="*")
     verify.add_argument("--all", action="store_true")
+    verify.add_argument(
+        "--format",
+        choices=CONTENT_FORMATS,
+        help="verify only one stored full-text format; omit to verify every stored format",
+    )
     verify.add_argument("--jsonl", action="store_true", help=JSONL_HELP)
     return parser
 
@@ -368,7 +413,7 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
             timeout = httpx.Timeout(30.0, connect=10.0)
             with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
                 return [
-                    {"ref": paper.ref, "dry_run": True, "pdf_url": paper.pdf_url}
+                    _dry_run_record(paper, args.format)
                     for paper in (_get_remote(ref, database, client) for ref in args.refs)
                 ]
         except sqlite3.Error as error:
@@ -394,19 +439,36 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
             if database is not None:
                 database.close()
 
-    ensure_paths(paths)
-    database = Database(paths.database_path)
-    try:
-        if args.command == "list":
-            return database.list(args.source, args.limit)
-        if args.command == "path":
-            return [str(local_path(paths, database.get(ref))) for ref in args.refs]
-        if args.command == "verify":
+    if args.command in {"list", "path", "verify"}:
+        if not paths.database_path.is_file():
+            if args.command == "list" or (args.command == "verify" and args.all):
+                return []
+            missing = args.refs[0]
+            raise PapersError("not_found", f"No local paper matches {missing}", exit_code=3)
+        database = None
+        try:
+            database = Database(paths.database_path, read_only=True)
+            if args.command == "list":
+                return database.list(args.source, args.limit)
+            if args.command == "path":
+                return [str(local_path(paths, database.get(ref), args.format)) for ref in args.refs]
             records = (
                 database.list(None, None) if args.all else [database.get(ref) for ref in args.refs]
             )
-            return [verify_file(paths, record) for record in records]
+            if args.format is None:
+                return [verify_file(paths, record) for record in records]
+            return [verify_file(paths, record, args.format) for record in records]
+        except sqlite3.Error as error:
+            raise PapersError(
+                "storage_unavailable", "Unable to read the local collection", exit_code=5
+            ) from error
+        finally:
+            if database is not None:
+                database.close()
 
+    ensure_paths(paths)
+    database = Database(paths.database_path)
+    try:
         timeout = httpx.Timeout(30.0, connect=10.0)
         with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
             if args.command == "download":
@@ -414,7 +476,8 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
                 for ref in args.refs:
                     paper = _get_remote(ref, database, client)
                     adapter = adapter_for(paper.source)
-                    downloaded = download_pdf(client, paper.pdf_url, adapter.allowed_hosts, paths)
+                    target = adapter.download_target(paper, args.format)
+                    downloaded = download_file(client, target, paths)
                     paper_id = database.upsert_paper(paper)
                     database.attach_file(paper_id, downloaded, paper.source_version)
                     stored.append(database.get(paper_id))

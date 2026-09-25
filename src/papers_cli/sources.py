@@ -9,7 +9,7 @@ import httpx
 from defusedxml import ElementTree
 
 from .errors import PapersError
-from .models import RemotePaper
+from .models import DownloadTarget, RemotePaper, content_media_type
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv"
@@ -36,6 +36,8 @@ class SourceAdapter(Protocol):
 
     def search(self, query: str, limit: int, client: httpx.Client) -> list[RemotePaper]: ...
 
+    def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget: ...
+
 
 def _without_source_prefix(raw: str, source: str) -> str:
     """Remove an optional source prefix without making it case-sensitive."""
@@ -53,6 +55,30 @@ def _remote_doi_unsupported() -> PapersError:
         "bioRxiv. A doi:DOI reference is only a local collection alias.",
         exit_code=2,
     )
+
+
+def _download_target(
+    paper: RemotePaper, format: str, allowed_hosts: frozenset[str]
+) -> DownloadTarget:
+    url = paper.content_urls.get(format)
+    if url is None and format == "pdf":
+        url = paper.pdf_url
+    if url is None:
+        available_formats = sorted(
+            set(paper.content_urls) | ({"pdf"} if paper.pdf_url is not None else set())
+        )
+        raise PapersError(
+            "format_unavailable",
+            f"{paper.source} does not provide {format} full text for {paper.ref}",
+            exit_code=3,
+            details={
+                "ref": paper.ref,
+                "requested_format": format,
+                "available_formats": available_formats,
+                "availability": "known",
+            },
+        )
+    return DownloadTarget(format, url, allowed_hosts, content_media_type(format), paper.source)
 
 
 def _text(element: Element | None) -> str:
@@ -133,7 +159,11 @@ class ArxivAdapter:
             doi=doi.lower() if doi else None,
             landing_url=landing_url,
             pdf_url=pdf_link,
+            content_urls={"pdf": pdf_link},
         )
+
+    def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget:
+        return _download_target(paper, format, self.allowed_hosts)
 
     def _parse(self, body: bytes) -> list[RemotePaper]:
         try:
@@ -219,7 +249,11 @@ class BiorxivAdapter:
             doi=doi,
             landing_url=f"https://www.biorxiv.org/content/{doi}v{version}",
             pdf_url=f"https://www.biorxiv.org/content/{doi}v{version}.full.pdf",
+            content_urls={"pdf": f"https://www.biorxiv.org/content/{doi}v{version}.full.pdf"},
         )
+
+    def download_target(self, paper: RemotePaper, format: str) -> DownloadTarget:
+        return _download_target(paper, format, self.allowed_hosts)
 
     def lookup(self, raw: str, client: httpx.Client) -> RemotePaper:
         doi = self.normalize_ref(raw)

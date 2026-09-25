@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -24,6 +25,7 @@ def test_arxiv_normalizes_atom_fixture() -> None:
     assert paper.source_version == "2"
     assert paper.authors == ["Alice Example", "Bob Example"]
     assert paper.doi == "10.1000/test"
+    assert paper.content_urls == {"pdf": paper.pdf_url}
 
 
 def test_arxiv_lookup_uses_official_api() -> None:
@@ -44,7 +46,26 @@ def test_biorxiv_normalizes_official_response() -> None:
     with client_for(handler) as client:
         paper = BiorxivAdapter().lookup("10.1101/2024.01.01.123456", client)
     assert paper.ref == "biorxiv:10.1101/2024.01.01.123456"
+    assert paper.pdf_url is not None
     assert paper.pdf_url.endswith("v3.full.pdf")
+    assert paper.content_urls == {"pdf": paper.pdf_url}
+
+
+def test_download_target_reports_missing_pdf_with_available_formats() -> None:
+    paper = replace(
+        ArxivAdapter()._parse((FIXTURES / "arxiv.xml").read_bytes())[0],
+        pdf_url=None,
+        content_urls={"txt": "https://arxiv.org/text/2301.00001"},
+    )
+    with pytest.raises(PapersError) as error:
+        ArxivAdapter().download_target(paper, "pdf")
+    assert error.value.code == "format_unavailable"
+    assert error.value.details == {
+        "availability": "known",
+        "available_formats": ["txt"],
+        "ref": "arxiv:2301.00001",
+        "requested_format": "pdf",
+    }
 
 
 def test_biorxiv_rejects_general_search() -> None:
