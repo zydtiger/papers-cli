@@ -17,7 +17,7 @@ papers = "papers_cli.cli:main"
 [dependency-groups]
 dev = [
   "mypy>=1.13,<2",
-  "pytest>=8.3,<9",
+  "pytest>=9.0.3,<10",
   "ruff>=0.9,<1",
   "types-defusedxml>=0.7,<1",
 ]
