@@ -9,6 +9,7 @@ from typing import Final, NoReturn
 
 import httpx
 
+from . import __version__
 from .config import ensure_paths, get_paths
 from .db import LIST_PAPER_FIELDS, Database
 from .downloader import download_file
@@ -400,7 +401,9 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
     paths = get_paths()
     if args.command == "search":
         timeout = httpx.Timeout(30.0, connect=10.0)
-        with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+        with httpx.Client(
+            timeout=timeout, headers={"User-Agent": f"papers-cli/{__version__}"}
+        ) as client:
             found = adapter_for(args.source.lower()).search(args.query, args.limit, client)
             return [paper.as_dict() for paper in found]
 
@@ -413,7 +416,9 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
                 else None
             )
             timeout = httpx.Timeout(30.0, connect=10.0)
-            with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+            with httpx.Client(
+                timeout=timeout, headers={"User-Agent": f"papers-cli/{__version__}"}
+            ) as client:
                 return [_lookup_record(ref, database, client) for ref in args.refs]
         except sqlite3.Error as error:
             raise PapersError(
@@ -432,7 +437,9 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
                 else None
             )
             timeout = httpx.Timeout(30.0, connect=10.0)
-            with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+            with httpx.Client(
+                timeout=timeout, headers={"User-Agent": f"papers-cli/{__version__}"}
+            ) as client:
                 return [
                     _dry_run_record(paper, args.format)
                     for paper in (_get_remote(ref, database, client) for ref in args.refs)
@@ -491,7 +498,9 @@ def execute(args: argparse.Namespace) -> Sequence[object]:
     database = Database(paths.database_path)
     try:
         timeout = httpx.Timeout(30.0, connect=10.0)
-        with httpx.Client(timeout=timeout, headers={"User-Agent": "papers-cli/0.1"}) as client:
+        with httpx.Client(
+            timeout=timeout, headers={"User-Agent": f"papers-cli/{__version__}"}
+        ) as client:
             if args.command == "download":
                 stored = []
                 for ref in args.refs:
