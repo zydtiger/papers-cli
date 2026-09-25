@@ -18,8 +18,9 @@ from .models import (
     content_media_type,
 )
 
-DATABASE_SCHEMA_VERSION = 2
+DATABASE_SCHEMA_VERSION = 3
 LEGACY_DATABASE_SCHEMA_VERSION = 1
+MULTIFORMAT_DATABASE_SCHEMA_VERSION = 2
 
 # Top-level keys that Database._row_to_dict adds beyond the shared remote-paper
 # vocabulary; tests pin both constants to the serialized record keys.
@@ -76,6 +77,7 @@ class Database:
     def _validate_schema_version(self) -> None:
         if self.schema_version not in {
             LEGACY_DATABASE_SCHEMA_VERSION,
+            MULTIFORMAT_DATABASE_SCHEMA_VERSION,
             DATABASE_SCHEMA_VERSION,
         }:
             raise PapersError(
@@ -96,9 +98,12 @@ class Database:
                     "Local collection has no recognized schema version",
                     exit_code=5,
                 )
-            self._create_schema_v2()
+            self._create_schema_v3()
         elif version == LEGACY_DATABASE_SCHEMA_VERSION:
             self._migrate_v1_to_v2()
+            self._migrate_v2_to_v3()
+        elif version == MULTIFORMAT_DATABASE_SCHEMA_VERSION:
+            self._migrate_v2_to_v3()
         elif version != DATABASE_SCHEMA_VERSION:
             raise PapersError(
                 "storage_unavailable",
@@ -107,7 +112,7 @@ class Database:
             )
         self.schema_version = DATABASE_SCHEMA_VERSION
 
-    def _create_schema_v2(self) -> None:
+    def _create_schema_v3(self) -> None:
         try:
             self.connection.executescript(
                 f"""
@@ -127,6 +132,11 @@ class Database:
                     landing_url TEXT NOT NULL,
                     pdf_url TEXT,
                     content_urls_json TEXT NOT NULL DEFAULT '{{}}',
+                    pmcid TEXT,
+                    pmid TEXT,
+                    license_code TEXT,
+                    fulltext_availability TEXT NOT NULL DEFAULT 'unknown'
+                        CHECK(fulltext_availability IN ('available', 'unavailable', 'unknown')),
                     created_at TEXT NOT NULL,
                     refreshed_at TEXT NOT NULL,
                     UNIQUE(source, source_key)
@@ -245,7 +255,7 @@ class Database:
             self.connection.execute(
                 "CREATE INDEX paper_files_format ON paper_files(paper_id, format)"
             )
-            self.connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+            self.connection.execute(f"PRAGMA user_version = {MULTIFORMAT_DATABASE_SCHEMA_VERSION}")
             self.connection.commit()
         except sqlite3.Error as exc:
             if self.connection.in_transaction:
@@ -256,11 +266,34 @@ class Database:
         finally:
             self.connection.execute("PRAGMA foreign_keys = ON")
 
+    def _migrate_v2_to_v3(self) -> None:
+        """Add optional provider identifiers without changing stored paper identities."""
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            self.connection.execute("ALTER TABLE papers ADD COLUMN pmcid TEXT")
+            self.connection.execute("ALTER TABLE papers ADD COLUMN pmid TEXT")
+            self.connection.execute("ALTER TABLE papers ADD COLUMN license_code TEXT")
+            self.connection.execute(
+                "ALTER TABLE papers ADD COLUMN fulltext_availability TEXT NOT NULL "
+                "DEFAULT 'unknown' "
+                "CHECK(fulltext_availability IN ('available', 'unavailable', 'unknown'))"
+            )
+            self.connection.execute(f"PRAGMA user_version = {DATABASE_SCHEMA_VERSION}")
+            self.connection.commit()
+        except sqlite3.Error as exc:
+            if self.connection.in_transaction:
+                self.connection.rollback()
+            raise PapersError(
+                "storage_unavailable", "Unable to migrate the local collection", exit_code=5
+            ) from exc
+
     @staticmethod
     def _aliases(paper: RemotePaper) -> list[tuple[str, str]]:
-        aliases = [(paper.source, paper.source_key)]
+        aliases = [(paper.source, paper.source_key.lower())]
         if paper.doi:
             aliases.append(("doi", paper.doi.lower()))
+        if paper.pmid:
+            aliases.append(("pmid", paper.pmid.lower()))
         return aliases
 
     @staticmethod
@@ -276,15 +309,20 @@ class Database:
         now = _now()
         candidate_id = uuid7()
         content_urls = self._content_urls(paper)
+        if paper.fulltext_availability not in {"available", "unavailable", "unknown"}:
+            raise PapersError(
+                "storage_corrupt", "Paper full-text availability is invalid", exit_code=5
+            )
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO papers (
                     id, source, source_key, source_version, title, abstract,
                     authors_json, categories_json, published_at, updated_at, doi,
-                    landing_url, pdf_url, content_urls_json, created_at, refreshed_at
+                    landing_url, pdf_url, content_urls_json, pmcid, pmid, license_code,
+                    fulltext_availability, created_at, refreshed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, source_key) DO UPDATE SET
                   source_version=excluded.source_version,
                   title=excluded.title,
@@ -297,6 +335,10 @@ class Database:
                   landing_url=excluded.landing_url,
                   pdf_url=excluded.pdf_url,
                   content_urls_json=excluded.content_urls_json,
+                  pmcid=excluded.pmcid,
+                  pmid=excluded.pmid,
+                  license_code=excluded.license_code,
+                  fulltext_availability=excluded.fulltext_availability,
                   refreshed_at=excluded.refreshed_at
                 """,
                 (
@@ -314,6 +356,10 @@ class Database:
                     paper.landing_url,
                     paper.pdf_url,
                     json.dumps(content_urls, sort_keys=True),
+                    paper.pmcid,
+                    paper.pmid,
+                    paper.license_code,
+                    paper.fulltext_availability,
                     now,
                     now,
                 ),
@@ -467,6 +513,12 @@ class Database:
             "published_at": row["published_at"],
             "updated_at": row["updated_at"],
             "doi": row["doi"],
+            "pmcid": row["pmcid"] if "pmcid" in row.keys() else None,
+            "pmid": row["pmid"] if "pmid" in row.keys() else None,
+            "license_code": row["license_code"] if "license_code" in row.keys() else None,
+            "fulltext_availability": (
+                row["fulltext_availability"] if "fulltext_availability" in row.keys() else "unknown"
+            ),
             "landing_url": row["landing_url"],
             "pdf_url": row["pdf_url"],
             "content_urls": content_urls,

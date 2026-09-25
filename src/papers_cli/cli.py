@@ -47,9 +47,9 @@ MACHINE_CONTRACT_EPILOG = (
 
 REFERENCE_CONTRACT_EPILOG = (
     "Remote references are normally source-qualified (for example, arxiv:IDENTIFIER "
-    "or biorxiv:10.1101/DOI); unqualified arXiv and bioRxiv identifiers remain "
-    "supported. A doi:DOI reference is resolved only from the local collection and "
-    "is never sent to a remote DOI service."
+    "biorxiv:10.1101/DOI, or pmc:PMCIDENTIFIER); unqualified arXiv, bioRxiv, and "
+    "PMC identifiers remain supported. A doi:DOI reference is resolved only from the "
+    "local collection and is never sent to a remote DOI service."
 )
 
 VERIFY_CONTRACT_EPILOG = (
@@ -106,6 +106,10 @@ def _remote_from_local(record: dict[str, object]) -> RemotePaper:
     categories = record["categories"]
     if not isinstance(authors, list) or not isinstance(categories, list):
         raise PapersError("storage_corrupt", "Local metadata lists are invalid", exit_code=5)
+    title = record["title"]
+    landing_url = record["landing_url"]
+    if not isinstance(title, str) or not isinstance(landing_url, str):
+        raise PapersError("storage_corrupt", "Local metadata is invalid", exit_code=5)
     pdf_url = record["pdf_url"]
     content_urls = record.get("content_urls", {})
     if (
@@ -124,16 +128,22 @@ def _remote_from_local(record: dict[str, object]) -> RemotePaper:
         source_version=str(record["source_version"])
         if record["source_version"] is not None
         else None,
-        title=str(record["title"]),
+        title=title,
         abstract=str(record["abstract"]),
         authors=[str(item) for item in authors],
         categories=[str(item) for item in categories],
         published_at=str(record["published_at"]) if record["published_at"] is not None else None,
         updated_at=str(record["updated_at"]) if record["updated_at"] is not None else None,
         doi=str(record["doi"]) if record["doi"] is not None else None,
-        landing_url=str(record["landing_url"]),
+        landing_url=landing_url,
         pdf_url=pdf_url,
         content_urls={str(format): str(url) for format, url in content_urls.items()},
+        pmcid=str(record["pmcid"]) if record.get("pmcid") is not None else None,
+        pmid=str(record["pmid"]) if record.get("pmid") is not None else None,
+        license_code=(
+            str(record["license_code"]) if record.get("license_code") is not None else None
+        ),
+        fulltext_availability=str(record.get("fulltext_availability", "unknown")),
     )
 
 

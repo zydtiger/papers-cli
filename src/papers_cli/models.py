@@ -41,6 +41,10 @@ class RemotePaper:
     landing_url: str
     pdf_url: str | None
     content_urls: dict[str, str] = field(default_factory=dict)
+    pmcid: str | None = None
+    pmid: str | None = None
+    license_code: str | None = None
+    fulltext_availability: str = "unknown"
 
     @property
     def ref(self) -> str:
@@ -65,6 +69,10 @@ REMOTE_PAPER_FIELDS: Final[tuple[str, ...]] = (
     "published_at",
     "updated_at",
     "doi",
+    "pmcid",
+    "pmid",
+    "license_code",
+    "fulltext_availability",
     "landing_url",
     "pdf_url",
     "content_urls",
@@ -78,6 +86,7 @@ class DownloadTarget:
     allowed_hosts: frozenset[str]
     media_type: str
     provider: str
+    accepted_content_types: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,0 +1,12 @@
+{
+  "result": {
+    "uids": ["9999999"],
+    "9999999": {
+      "uid": "9999999",
+      "title": "Embargoed PMC article",
+      "pubdate": "2026 Sep 1",
+      "authors": [{"name": "Alice Example"}],
+      "fulljournalname": "Example Journal"
+    }
+  }
+}

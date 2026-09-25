@@ -382,6 +382,81 @@ def test_dry_run_does_not_create_collection_state(monkeypatch, tmp_path, capsys)
     assert not cache_dir.exists()
 
 
+def test_pmc_downloads_each_official_fulltext_format(monkeypatch, tmp_path, capsys) -> None:
+    requested_files: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            return httpx.Response(200, content=(FIXTURES / "pmc-idconv-current.json").read_bytes())
+        if request.url.path == "/metadata/PMC3531190.1.json":
+            return httpx.Response(
+                200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+            )
+        requested_files.append(request.url.path)
+        if request.url.path.endswith(".pdf"):
+            return httpx.Response(
+                200, headers={"content-type": "binary/octet-stream"}, content=pdf_bytes()
+            )
+        if request.url.path.endswith(".txt"):
+            return httpx.Response(
+                200, headers={"content-type": "binary/octet-stream"}, content=b"article text"
+            )
+        if request.url.path.endswith(".xml"):
+            return httpx.Response(
+                200,
+                headers={"content-type": "binary/octet-stream"},
+                content=b"<article><body>article body</body></article>",
+            )
+        pytest.fail(f"unexpected request {request.url}")
+
+    mock_transport(monkeypatch, handler)
+    data_dir, _ = isolated_dirs(monkeypatch, tmp_path)
+    for format in ("pdf", "txt", "xml"):
+        assert cli.main(["download", "PMC3531190", "--format", format, "--jsonl"]) == 0
+        assert read_jsonl_records(capsys)[0]["source"] == "pmc"
+
+    database = Database(data_dir / "papers.sqlite3", read_only=True)
+    record = database.get("pmc:PMC3531190")
+    database.close()
+    files = record["files"]
+    assert isinstance(files, list)
+    assert [file["format"] for file in files if isinstance(file, dict)] == ["pdf", "txt", "xml"]
+    assert requested_files == [
+        "/PMC3531190.1/PMC3531190.1.pdf",
+        "/PMC3531190.1/PMC3531190.1.txt",
+        "/PMC3531190.1/PMC3531190.1.xml",
+    ]
+
+
+def test_pmc_dry_run_selects_cloud_url_without_writing(monkeypatch, tmp_path, capsys) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.host == "pmc.ncbi.nlm.nih.gov":
+            return httpx.Response(200, content=(FIXTURES / "pmc-idconv-current.json").read_bytes())
+        assert request.url.path == "/metadata/PMC3531190.1.json"
+        return httpx.Response(
+            200, content=(FIXTURES / "pmc-metadata-all-formats.json").read_bytes()
+        )
+
+    mock_transport(monkeypatch, handler)
+    data_dir, cache_dir = isolated_dirs(monkeypatch, tmp_path)
+
+    assert cli.main(["download", "pmc:PMC3531190", "--format", "xml", "--dry-run", "--jsonl"]) == 0
+    record = read_jsonl_records(capsys)[0]
+
+    assert record["source_url"] == (
+        "https://pmc-oa-opendata.s3.amazonaws.com/PMC3531190.1/PMC3531190.1.xml"
+    )
+    assert [request.url.path for request in requests] == [
+        "/tools/idconv/api/v1/articles/",
+        "/metadata/PMC3531190.1.json",
+    ]
+    assert not data_dir.exists()
+    assert not cache_dir.exists()
+
+
 def test_download_format_is_strict_and_never_falls_back_to_pdf(
     monkeypatch, tmp_path, capsys
 ) -> None:

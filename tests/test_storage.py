@@ -123,6 +123,7 @@ def test_download_rejects_invalid_non_pdf_content(tmp_path, format, media_type, 
     ("headers", "body", "code"),
     [
         ({"content-type": "text/html"}, b"%PDF-1.7", "not_pdf"),
+        ({"content-type": "binary/octet-stream"}, b"%PDF-1.7", "not_pdf"),
         ({"content-type": "application/pdf"}, b"HTML", "not_pdf"),
     ],
 )
@@ -136,6 +137,41 @@ def test_download_rejects_non_pdf(tmp_path, headers, body, code) -> None:
             download_pdf(client, "https://arxiv.org/pdf/x", frozenset({"arxiv.org"}), paths)
     assert error.value.code == code
     assert not list(paths.download_cache_dir.glob("download-*.part"))
+
+
+@pytest.mark.parametrize(
+    ("format", "body", "code"),
+    [
+        ("pdf", b"not a PDF", "not_pdf"),
+        ("txt", b"<!doctype html><html><body>error</body></html>", "not_text"),
+        ("xml", b"<article><body> </body></article>", "not_xml"),
+    ],
+)
+def test_pmc_opaque_content_type_still_validates_requested_format(
+    tmp_path, format, body, code
+) -> None:
+    paths = AppPaths(tmp_path / "data", tmp_path / "cache")
+    ensure_paths(paths)
+    target = DownloadTarget(
+        format,
+        f"https://pmc-oa-opendata.s3.amazonaws.com/PMC1.1/PMC1.1.{format}",
+        frozenset({"pmc-oa-opendata.s3.amazonaws.com"}),
+        {"pdf": "application/pdf", "txt": "text/plain", "xml": "application/xml"}[format],
+        "pmc",
+        frozenset({"binary/octet-stream"}),
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200, headers={"content-type": "binary/octet-stream"}, content=body
+            )
+        )
+    ) as client:
+        with pytest.raises(PapersError) as error:
+            download_file(client, target, paths)
+    assert error.value.code == code
+    assert not list(paths.download_cache_dir.glob("download-*.part"))
+    assert not list(paths.objects_dir.rglob(f"*.{format}"))
 
 
 @pytest.mark.parametrize(
