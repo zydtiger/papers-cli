@@ -9,7 +9,7 @@ dependencies = [
   "defusedxml>=0.7.1,<1",
   "httpx>=0.27,<1",
   "platformdirs>=4.12.0,<5",
-  "pypdf>=6.19,<7",
+  "pypdf>=6.21.2,<7",
 ]
 
 [project.scripts]
