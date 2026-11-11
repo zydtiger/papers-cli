@@ -97,6 +97,12 @@ uv tool install git+https://github.com/zydtiger/papers-cli.git
 papers sources --jsonl
 ```
 
+With Nix, run it from the flake, which builds the dependencies pinned in `uv.lock`:
+
+```sh
+nix run github:zydtiger/papers-cli -- sources --jsonl
+```
+
 Then install the committed root skill globally in file mode:
 
 ```sh
